@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description:  Windows Instance Stack Template
+
+Parameters: 
+  MyKeyName:
+    Type: AWS::EC2::KeyPair::KeyName 
+    Default: #keyname
+
+  SubnetId:
+    Type: String
+    Default: #subent id
+
+  securitygroup:
+    Type: String
+    Default: #sg-id
+  
+  ImageId:
+    Type: String
+    Default: #ami
+
+  InstanceType:
+    Type: String
+    Default: t2.medium
+
+Resources: 
+  WindowsInstance:
+        Type: 'AWS::EC2::Instance'
+        Properties:
+          ImageId: !Ref ImageId
+          InstanceType: !Ref InstanceType
+          KeyName: !Ref MyKeyName
+          SubnetId: !Ref SubnetId
+          SecurityGroupIds: 
+              - !Ref securitygroup
+          UserData:
+            Fn::Base64: !Sub |
+              <powershell>
+              Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+              $chocoInstall = New-TemporaryFile
+              'Installing chocolatey package manager.'
+              'Check version with `choco.exe --version`.'
+              [Net.WebClient]::new().DownloadString(
+                  'https://chocolatey.org/install.ps1'
+              ) | Out-File -FilePath $chocoInstall.FullName -Encoding UTF8
+              . $chocoInstall.FullName
+
+              'Chocolatey installed. Installing NodeJS and NPM via Chocolatey.'
+              & "$Env:ProgramData\chocolatey\choco.exe" install nodejs --yes --force
+
+              'Installation complete.'
+              $url = "https://download.visualstudio.microsoft.com/download/pr/9fcc1f0c-c63f-4424-bc46-7351a59fba06/1ed7863dc633c57c42a88c5cef907048/vs_community.exe"
+              New-Item -Path 'C:\dev\pub\vs' -ItemType Directory -force
+              $downloadPath = "C:\dev\pub\vs"
+              $filePath = "C:\dev\pub\vs\vs_community.exe"
+              Invoke-WebRequest -URI $url -OutFile $filePath
+              powershell -command '& "C:\dev\pub\vs\vs_community.exe" --installPath C:\minVS --add Microsoft.VisualStudio.Workload.CoreEditor --passive --norestart'
+              $source = "http://rarlab.com/rar/winrar-x64-540.exe"
+              $destination = "$workdir\winrar.exe"
+              Invoke-WebRequest $source -OutFile $destination
+              Start-Process -FilePath "$workdir\winrar.exe" -ArgumentList "/S"
+              $code_path="C:\minVS\Common7\IDE\devenv.exe"
+              Start-Process -FilePath $code_path
+
+              </powershell>
+              <persist>true</persist>   
+          Tags:
+              - Key: Appplication
+                Value: "Windows"
+              - Key: Name
+                Value: "WEB"

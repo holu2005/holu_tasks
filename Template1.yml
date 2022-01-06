@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Used to Build a Windows 2016 Build-Server with MSBuild 2015 and 2017
+
+Parameters:
+
+  InstanceKey:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an Existing EC2 Key Pair
+    Default: cwpf-devnet
+  S3BucketGitlab:
+    Type: String
+    Default: pf-gitlabapp
+    Description: Shared S3 Bucket for GitLab App and Runners
+  S3BucketToolsPath:
+    Type: String
+    Default: runners/vs2015/tools
+    Description: Path within S3 Bucket to Tools Folder
+  S3BucketStackConfigPath:
+    Type: String
+    Default: runners/vs2015
+    Description: Path within S3 Bucket to Stack's Config Folder
+  InstanceImageId:
+    Description: Window Server AMI
+    Type: String
+    MinLength: 1
+    Default: ami-f0df538f
+  InstanceSize:
+    Description: Size of the instance(s) for GitLab
+    Type: String
+    MinLength: 4
+    Default: m5.2xlarge
+    AllowedValues:
+    - t2.medium
+    - t2.large
+    - t2.xlarge
+    - t2.2xlarge
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    - m5.4xlarge
+    - m5.12xlarge
+    - c5.large
+    - c5.xlarge
+    - c5.2xlarge
+    - c5.4xlarge
+    - c5.9xlarge
+    - c5.18xlarge
+  TdsLicenseKey:
+    Description: Team Development for SiteCore License key
+    Type: String
+  VpcNetworkNat01SubnetId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Default: /pf-vpcnetwork-default/resources/ec2/subnet/nat-01/subnet-id
+  GitCommitSha:
+    Description: Version number of this stack. Increment to force instance updates.
+    Type: String
+    Default: unknown
+    MinLength: 1
+
+Resources:
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          config:
+          - 01-InstallChocolatey
+          - 02-ConfigureWindows
+          - 03-InstallDevTooling
+          - 90-InstallOptionalTools
+          - 98-ResetSysPrep
+          - 99-Finalize
+        01-InstallChocolatey:
+          files:
+            C:\Windows\Temp\Install-Chocolatey.ps1:
+              content: !Sub |
+                Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'));
+          commands:
+            00_install_chocolatey:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Chocolatey.ps1
+              waitAfterCompletion: '0'
+        02-ConfigureWindows:
+          files:
+            C:\Windows\Temp\Install-AWSPowerShell.ps1:
+              content: !Sub |
+                Install-Module -Name AWSPowerShell -Force | ConvertTo-Json -Compress;
+                choco install -y awscli
+            C:\Windows\Temp\Install-NugetPackageProvider.ps1:
+              content: !Sub |
+                Install-PackageProvider -Name NuGet -Force | ConvertTo-Json -Compress;
+            C:\Windows\Temp\Install-DotNet35.ps1:
+              content: !Sub |
+                Install-WindowsFeature NET-Framework-Core -IncludeAllSubFeature -Confirm:$false | ConvertTo-Json -Compress;
+          commands:
+            00_add_bin_dir:
+              command: mkdir -p c:\bin
+              waitAfterCompletion: '0'
+            01_install_dotnet35:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-DotNet35.ps1
+              waitAfterCompletion: '0'
+            02_register_pkg_provider:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-NugetPackageProvider.ps1
+              waitAfterCompletion: '0'
+            03_install_aws_powershell:
+              cwd: C:\ProgramData\Chocolatey
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-AWSPowerShell.ps1
+              waitAfterCompletion: '0'
+        03-InstallDevTooling:
+          files:
+            C:\Windows\Temp\Install-VisualStudio.ps1:
+              content: !Sub |
+                Read-S3Object -BucketName '${S3BucketGitlab}' -KeyPrefix '${S3BucketToolsPath}\vs2015-3' -Folder 'C:\Windows\Temp\vs2015-3' -Region 'us-east-1';
+                Set-Location 'C:\Windows\Temp\vs2015-3';
+                .\vs2015-3.exe /adminfile 'C:\Windows\Temp\vs2015-3\vs2015-3.config.xml' /s /l C:\Windows\Temp\vs2015-3\vs2015-3.log
+                while ((Get-Process vs2015*) -ne $null) { Write-Output "$((Get-Date).ToString("s")) - installing VS2015..."; Sleep 15; }
+            C:\Windows\Temp\Install-Tds.ps1:
+              content: !Sub |
+                Read-S3Object -BucketName '${S3BucketGitlab}' -KeyPrefix '${S3BucketToolsPath}\tds-v6.0' -Folder 'C:\Windows\Temp\tds-v6.0' -Region 'us-east-1';
+                Set-Location 'C:\Windows\Temp\tds-v6.0';
+                .\SitecoreTDS_VS2015.msi /lv tds-v6.0.log /qn /norestart LICENSEKEY="${TdsLicenseKey}" PRODUCTOWNER="connectwise"
+            C:\Windows\Temp\Install-Nuget.ps1:
+              content: !Sub |
+                Read-S3Object -BucketName '${S3BucketGitlab}' -KeyPrefix '${S3BucketToolsPath}\nuget-v4.6' -Folder 'C:\Windows\Temp\nuget-v4.6' -Region 'us-east-1';
+                Copy-Item 'C:\Windows\Temp\nuget-v4.6\nuget.exe' 'C:\bin\nuget.exe' -Force;
+                mkdir -p "C:\Windows\System32\Config\SystemProfile\AppData\Roaming\NuGet"
+                Copy-Item 'C:\Windows\Temp\nuget-v4.6\nuget.config' 'C:\Windows\System32\Config\SystemProfile\AppData\Roaming\NuGet\nuget.config' -Force;
+                mkdir -p "C:\Users\Administrator\AppData\Roaming\NuGet"
+                Copy-Item 'C:\Windows\Temp\nuget-v4.6\nuget.config' 'C:\Users\Administrator\AppData\Roaming\NuGet\nuget.config' -Force;
+            C:\Windows\Temp\Update-TypeScript.ps1:
+              content: !Sub |
+                Set-Location 'C:\Windows\Temp\vs2015-3';
+                $url = 'https://download.microsoft.com/download/6/D/8/6D8381B0-03C1-4BD2-AE65-30FF0A4C62DA/3.0.1-TS-release-dev14update3-20180725.1/TypeScript_Dev14Full.exe';
+                $outpath = "C:\Windows\Temp\vs2015-3\TypeScript.exe";
+                Invoke-WebRequest -Uri $url -OutFile $outpath
+                $args = @("/quiet","/norestart","/log `"$env:TEMP\tsvs2015.Install.log`"");
+                Start-Process -Filepath $outpath -ArgumentList $args
+          commands:
+            00_install_git:
+              cwd: C:\ProgramData\Chocolatey
+              command: choco install -y git.install --params "/WindowsTerminal /NoShellIntegration"
+              waitAfterCompletion: '0'
+            01_install_vs2015:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-VisualStudio.ps1
+              waitAfterCompletion: '0'
+            02_install_tds:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Tds.ps1
+              waitAfterCompletion: '0'
+            03_install_nuget:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Nuget.ps1
+              waitAfterCompletion: '0'
+            04_update_typescript:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Update-TypeScript.ps1
+              waitAfterCompletion: '0'
+        04-InstallDockerService:  # skipping this step (see `configSets`)
+          files:
+            C:\Windows\Temp\Install-Docker.ps1:
+              content: !Sub |
+                Invoke-WebRequest -UseBasicParsing -Outfile docker-17.06.2-ee-8.zip https://download.docker.com/components/engine/windows-server/17.06/docker-17.06.2-ee-8.zip;
+                Expand-Archive docker-17.06.2-ee-8.zip -DestinationPath $Env:ProgramFiles;
+                Remove-Item -Force docker-17.06.2-ee-8.zip;
+                Install-WindowsFeature Containers -IncludeAllSubFeature | ConvertTo-Json -Compress;
+            C:\Windows\Temp\Initialize-DockerService.ps1:
+              content: !Sub |
+                Set-Location 'C:\Program Files\docker';
+                .\dockerd --register-service;
+                Start-Service docker;
+                .\docker run --rm hello-world:nanoserver;
+          commands:
+            00_install_docker:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Docker.ps1
+              waitAfterCompletion: '0'
+            01_restart_server:
+              command: powershell -Command "Restart-Computer -Force"
+              waitAfterCompletion: 'forever'
+            02_config_docker_service:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Initialize-DockerService.ps1
+              waitAfterCompletion: '0'
+        90-InstallOptionalTools:
+          commands:
+            00_install_chrome:
+              cwd: C:\ProgramData\Chocolatey
+              command: choco install -y googlechrome
+              ignoreErrors: true
+              waitAfterCompletion: '0'
+            01_install_vscode:
+              cwd: C:\ProgramData\Chocolatey
+              command: choco install -y vscode
+              ignoreErrors: true
+              waitAfterCompletion: '0'
+        98-ResetSysPrep:
+          files:
+            C:\Windows\Temp\Set-Ec2LaunchConfig.ps1:
+              content: !Sub |
+                $EC2_LAUNCH_CONFIG_PATH = "C:\ProgramData\Amazon\EC2-Windows\Launch\Config\LaunchConfig.json";
+                $config = Get-Content -Path $EC2_LAUNCH_CONFIG_PATH | ConvertFrom-Json;
+                $config.setComputerName = $True;
+                $config | ConvertTo-Json -Compress | Out-File -FilePath $EC2_LAUNCH_CONFIG_PATH -Encoding utf8;
+          commands:
+            00_set_ec2_launch_config:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Set-Ec2LaunchConfig.ps1
+              waitAfterCompletion: '0'
+            01_enable_aws_instance_init:
+              command: schtasks.exe /Change /TN "Amazon Ec2 Launch - Instance Initialization" /Enable
+              waitAfterCompletion: '0'
+        99-Finalize:
+          commands:
+            00_signal_success:
+              command: !Sub cfn-signal.exe -e %ERRORLEVEL% "${WaitHandle}"
+              waitAfterCompletion: '0'
+    Properties:
+      ImageId: !Ref InstanceImageId
+      InstanceType: !Ref InstanceSize
+      IamInstanceProfile: !Ref InstanceProfileEc2
+      EbsOptimized: true
+      KeyName: !Ref InstanceKey
+      SubnetId: !Ref VpcNetworkNat01SubnetId
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeSize: 100
+          VolumeType: gp2
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}
+      UserData:
+        Fn::Base64:
+          !Sub |
+            <powershell>
+              [Environment]::SetEnvironmentVariable("BUILD_GIT_COMMIT_SHA", "${GitCommitSha}", [EnvironmentVariableTarget]::Machine);
+
+              # add all paths to the PATH variable; must set before calling cfn-init
+              $env:Path = "$env:Path;C:\bin"
+              $env:Path = "$env:Path;C:\ProgramData\chocolatey"
+              $env:Path = "$env:Path;C:\Program Files\Git\cmd"
+              $env:Path = "$env:Path;C:\Program Files (x86)\MSBuild\14.0\Bin"
+              [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine);
+
+              cfn-init.exe -v -c config --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+            </powershell>
+
+  RoleEc2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: CloudWatchLog
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+      - PolicyName: S3Bucket
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:List*
+            Resource:
+            - !Sub arn:aws:s3:::${S3BucketGitlab}
+            - !Sub arn:aws:s3:::${S3BucketGitlab}/*
+          - Effect: Allow
+            Action:
+            - s3:Get*
+            Resource:
+            - !Sub arn:aws:s3:::${S3BucketGitlab}/${S3BucketToolsPath}/*
+          - Effect: Allow
+            Action:
+            - s3:*
+            Resource:
+            - !Sub arn:aws:s3:::${S3BucketGitlab}/${S3BucketStackConfigPath}/*
+
+  InstanceProfileEc2:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref RoleEc2
+
+  WaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: EC2Instance
+    Properties:
+      Handle: !Ref WaitHandle
+      Timeout: "7200"
+      Count: 1
+
+Outputs:
+
+  InstanceId:
+    Description: Instance Id
+    Value: !Ref EC2Instance

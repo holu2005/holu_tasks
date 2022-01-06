@@ -1,0 +1,370 @@
+default:
+  image: 284702229816.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default:v1
+
+stages:
+- validate
+- core
+- data
+- build
+- deploy
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  TAG_SERVICE_NAME: pf-jiraapp
+  TAG_TERRITORY: connectwise_us
+  TAG_BUSINESS_UNIT: corporate
+  TAG_DEPARTMENT: platform
+  TAG_PRODUCT: platform
+  TAG_CLASS: software
+  GROUP_ID: pf
+  SERVICE_ID: jiraapp
+  PF_NETWORK_STACK: cwpf-devnet
+  PF_DEVAPPS_STACK: cwpf-devnet-devapps
+  EFS_PATH_PROD: /mnt/efs-share/jira-ecs-prod
+  EFS_PATH_DEV: /mnt/efs-share/jira-ecs-dev
+  EFS_PATH_SANDBOX: /mnt/efs/jira-sandbox
+  ECS_TASK_COUNT: 1
+  JIRA_APPLICATION_VERSION: 8.18.1
+  ACCESS_STACK_NAME_PREFIX: pf-jiraappaccess
+  CORE_STACK_TEMPLATE: aws.cfn.core.yml
+  DATA_STACK_NAME_PREFIX: pf-jiraappdata
+  DATA_STACK_TEMPLATE: aws.cfn.data.yml
+  APP_STACK_NAME_PREFIX: pf-jiraapp
+  WAF_STACK_NAME_PREFIX: pf-jiraappwaf
+  APP_STACK_TEMPLATE: aws.cfn.jira.yml
+  STACK_POLICY_PROTECTED: devops/aws.cfn-policy.protected.json
+  STACK_POLICY_UNRESTRICTED: devops/aws.cfn-policy.unrestricted.json
+
+  STACK_SERVICE_SUBDOMAIN: jiraapp
+
+before_script:
+  - '# --- print ci variables ------------------------------------------------'
+  - printenv | grep -E "^(CI_)" | sort
+  - ''
+  # - '# --- install dependencies ----------------------------------------------'
+  # - apk add --no-cache python3 jq py3-pip
+  # - pip3 install awscli
+  # - pip3 install boto3
+  - ''
+  - '# --- set shared variables ----------------------------------------------'
+  - export ACCESS_STACK_NAME=$ACCESS_STACK_NAME_PREFIX-$ACCOUNT_ENV_TYPE  # example: pf-jiraappaccess-dev
+  - export DATA_STACK_NAME=$DATA_STACK_NAME_PREFIX-$ACCOUNT_ENV_TYPE    # example: pf-jiraappdata-dev
+  - export WAF_STACK_NAME=$WAF_STACK_NAME_PREFIX-$ACCOUNT_ENV_TYPE    # example: pf-jiraappwaf-dev
+  - export APP_STACK_NAME=$APP_STACK_NAME_PREFIX-$ACCOUNT_ENV_TYPE    # example: pf-jiraapp-dev
+  - export STACK_ECR_TAG_RUNTIME=$CI_COMMIT_REF_SLUG-$CI_PIPELINE_IID.$CI_PIPELINE_ID # example: dev-12.1234
+  - printenv | grep -E "^(ACCOUNT_|TAG_)" | sort
+  - ''
+
+after_script:
+  - '# --- print build ids ---------------------------------------------------'
+  - printenv | grep -E "^(CI_PIPELINE_ID|CI_PIPELINE_IID)" | sort
+
+# ================================================================= anchors ===
+
+.variables-cwprod: &cwprod
+  AWS_ACCESS_KEY_ID: $CWDEVPF_PROD_AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $CWDEVPF_PROD_AWS_SECRET_ACCESS_KEY
+  DEPLOY_TIER: production
+  ACCOUNT_ENV_TYPE: prod
+  ACCOUNT_ENV_TYPE_FULL: production
+  CPU_RESERVATION: 1536
+  MEMORY_RESERVATION: 10240
+  EFS_PATH: $EFS_PATH_PROD
+  ALERT_EMAIL: $INF_BOARD_EMAIL
+  STACK_NAME: $GROUP_ID-$SERVICE_ID-$ACCOUNT_ENV_TYPE
+  ACCOUNT_ECR_HOST: 926996344405.dkr.ecr.us-east-1.amazonaws.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE: cwpf.connectwisedev.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_ID: Z10BT86FB05YX8
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_SUBDOMAIN: jira-ecs-prod
+  ACCOUNT_ECS_CLUSTER: pf-ecscluster-devtools
+  APP_STACK_KEY_NAME: cwpf-devnet
+  APP_STACK_DNS_NAME: jira.connectwisedev.com
+  CORE_STACK_NAME: pf-jiraapp-core
+  JIRA_ECR_REPO_NAME: pf-jiraapp/jira
+
+.variables-cwdevpf: &cwdevpf
+  AWS_ACCESS_KEY_ID: $CWDEVPF_DEV_AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $CWDEVPF_DEV_AWS_SECRET_ACCESS_KEY
+  DEPLOY_TIER: dev
+  ACCOUNT_ENV_TYPE: dev
+  ACCOUNT_ENV_TYPE_FULL: development
+  CPU_RESERVATION: 1024
+  MEMORY_RESERVATION: 4096
+  ALERT_EMAIL: $INF_BOARD_EMAIL
+  STACK_NAME: $GROUP_ID-$SERVICE_ID-$ACCOUNT_ENV_TYPE
+  EFS_PATH: $EFS_PATH_DEV
+  ACCOUNT_ECR_HOST: 926996344405.dkr.ecr.us-east-1.amazonaws.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE: cwpf.connectwisedev.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_ID: Z10BT86FB05YX8
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_SUBDOMAIN: jira-ecs-dev
+  ACCOUNT_ECS_CLUSTER: pf-ecscluster-devtools
+  APP_STACK_KEY_NAME: cwpf-devnet
+  APP_STACK_DNS_NAME: jira-dev.connectwisedev.com
+  CORE_STACK_NAME: pf-jiraapp-core-dev
+  JIRA_ECR_REPO_NAME: pf-jiraapp/jira-dev
+
+
+.variables-cwdevsb: &cwdevsb
+  AWS_ACCESS_KEY_ID: $CWDEVSANDBOX_AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $CWDEVSANDBOX_AWS_SECRET_ACCESS_KEY
+  DEPLOY_TIER: dev
+  ACCOUNT_ENV_TYPE: test
+  ACCOUNT_ENV_TYPE_FULL: developmentsandbox
+  CPU_RESERVATION: 1024
+  MEMORY_RESERVATION: 4096
+  ALERT_EMAIL: $INF_BOARD_EMAIL
+  STACK_NAME: $GROUP_ID-$SERVICE_ID-$ACCOUNT_ENV_TYPE
+  EFS_PATH: $EFS_PATH_SANDBOX
+  ACCOUNT_ECR_HOST: 750161447794.dkr.ecr.us-east-1.amazonaws.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE: cwdevsb.connectwisedev.com
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_ID: Z2GOA1V0ELLJVM
+  ACCOUNT_R53_PUBLIC_HOSTED_ZONE_SUBDOMAIN: jira-ecs-test
+  ACCOUNT_ECS_CLUSTER: pf-ecscluster-devtools
+  APP_STACK_KEY_NAME: pf-jiraapp-bastion-zbridges
+  CORE_STACK_NAME: pf-jiraapp-core-test
+  JIRA_ECR_REPO_NAME: pf-jiraapp/jira-test
+
+.variables-cwprod-na: &cwprod_na
+  <<: *cwprod
+  AWS_DEFAULT_REGION: us-east-1
+  REGION_NAME: na
+  REGIONAL_SSL_CERT_ARN: arn:aws:acm:us-east-1:926996344405:certificate/06314164-f64a-40cf-a86c-c5fd507ab178
+
+.variables-cwprod-na: &cwdevpf_na
+  <<: *cwdevpf
+  AWS_DEFAULT_REGION: us-east-1
+  REGION_NAME: na
+  REGIONAL_SSL_CERT_ARN: arn:aws:acm:us-east-1:926996344405:certificate/06314164-f64a-40cf-a86c-c5fd507ab178
+
+.variables-cwdevsb-na: &cwdevsb_na
+  <<: *cwdevsb
+  AWS_DEFAULT_REGION: us-east-1
+  REGION_NAME: na
+  REGIONAL_SSL_CERT_ARN: arn:aws:acm:us-east-1:750161447794:certificate/ae471711-ea06-46b6-a486-85c285d82f13
+
+# =============================================================== templates ===
+
+.job-validate-templates:
+  tags:
+    - default
+  script:
+    - '# --- validate templates ---------------------------------------------------'
+    - for template in aws.cfn.*.yml; do aws cloudformation validate-template --template-body file://$template; done
+    - ''
+
+.job-deploy-jira:
+  tags:
+    - default
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - export STACK_JIRA_IMAGE=$ACCOUNT_ECR_HOST/$JIRA_ECR_REPO_NAME:$JIRA_APPLICATION_VERSION
+    - printenv | grep -E "^(APP_|CORE_|DATA_|STACK_)" | sort
+    - ''
+    - '# --- deploy stack ---------------------------------------------------'
+    - >-
+      aws cloudformation deploy
+      --stack-name $APP_STACK_NAME
+      --template-file $APP_STACK_TEMPLATE
+      --no-fail-on-empty-changeset
+      --parameter-overrides
+      JiraEfsPath=$EFS_PATH
+      CpuReservation=$CPU_RESERVATION
+      MemoryReservation=$MEMORY_RESERVATION
+      CerticateArn=$REGIONAL_SSL_CERT_ARN
+      PublicHostedZoneSubdomainName=$ACCOUNT_R53_PUBLIC_HOSTED_ZONE_SUBDOMAIN
+      PublicHostedZone=$ACCOUNT_R53_PUBLIC_HOSTED_ZONE
+      PublicHostedZoneId=$ACCOUNT_R53_PUBLIC_HOSTED_ZONE_ID
+      JiraImage=$STACK_JIRA_IMAGE
+      RdsClusterSecretArn=/$DATA_STACK_NAME/resources/secretsmanager/secret/postgres-master-secrets/arn
+      EcsClusterName=/$ACCOUNT_ECS_CLUSTER/resources/ecs/cluster/cluster-name
+      EcsClusterGeneralSecGrpId=/$ACCOUNT_ECS_CLUSTER/resources/ec2/security-group/general/group-id
+      DnsName=$APP_STACK_DNS_NAME
+      JiraEcsTaskExecutionIamRoleArn=/$ACCESS_STACK_NAME/resources/iam/role/svc-jira-ecs-taskexecution/arn
+      JiraEcsTaskIamRoleArn=/$ACCESS_STACK_NAME/resources/iam/role/svc-jira-ecs-task/arn
+      JiraAppSecGroupId=/$CORE_STACK_NAME/resources/ec2/security-group/jira-public/group-id
+      StackServiceSubdomain=${STACK_SERVICE_SUBDOMAIN}
+
+      --tags
+      service_name=$TAG_SERVICE_NAME
+      territory=$TAG_TERRITORY
+      region=$AWS_DEFAULT_REGION
+      business_unit=$TAG_BUSINESS_UNIT
+      department=$TAG_DEPARTMENT
+      product=$TAG_PRODUCT
+      class=$TAG_CLASS
+      subclass=$ACCOUNT_ENV_TYPE_FULL
+      cw:devops:branch=$CI_COMMIT_REF_SLUG
+      cw:devops:build=$CI_PIPELINE_IID.$CI_PIPELINE_ID
+      cw:devops:project-url=$CI_PROJECT_URL
+      cw:devops:ci=true
+    - ''
+
+.job-deploy-data:
+  tags:
+    - default
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - export DATA_RDS_CLUSTER_NAME="${DATA_STACK_NAME//-}"
+    - printenv | grep -E "^(CORE_|APP_|DATA_)" | sort
+    - '# --- deploy stack ---------------------------------------------------'
+    - >-
+      aws cloudformation deploy
+      --stack-name $DATA_STACK_NAME
+      --template-file $DATA_STACK_TEMPLATE
+      --no-fail-on-empty-changeset
+      --parameter-overrides
+      BastionSecGrp=/$CORE_STACK_NAME/resources/ec2/security-group/bastion/group-id
+      PostgresRdsDbClusterSecGrp=/$CORE_STACK_NAME/resources/ec2/security-group/rds/group-id
+      RdsClusterName=$DATA_RDS_CLUSTER_NAME
+      RdsClusterSnapshotName=$RDS_CLUSTER_SNAPSHOT_NAME
+      BastionInstanceProfile=/$ACCESS_STACK_NAME/resources/iam/instance-profile/svc-bastion/name
+      BastionKey=$APP_STACK_KEY_NAME
+      --tags
+      service_name=$TAG_SERVICE_NAME
+      territory=$TAG_TERRITORY
+      region=$AWS_DEFAULT_REGION
+      business_unit=$TAG_BUSINESS_UNIT
+      department=$TAG_DEPARTMENT
+      product=$TAG_PRODUCT
+      class=$TAG_CLASS
+      subclass=$ACCOUNT_ENV_TYPE_FULL
+      cw:devops:branch=$CI_COMMIT_REF_SLUG
+      cw:devops:build=$CI_PIPELINE_IID.$CI_PIPELINE_ID
+      cw:devops:project-url=$CI_PROJECT_URL
+      cw:devops:ci=true
+    - ''
+
+
+.job-build-docker-image:
+  tags:
+    - default
+  image: 284702229816.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default-loaded:v1
+  services:
+    - docker:dind
+  variables:
+    JOB_DOCKER_BUILD_CONTEXT: .
+  script:
+    - '# --- set variables -----------------------------------------------------'
+    - export JOB_ECR_IMAGE=$ACCOUNT_ECR_HOST/$JOB_ECR_NAME:$JIRA_APPLICATION_VERSION
+    - printenv | grep -E "^(APP_|CORE_|JOB_|STACK_)" | sort
+    - ''
+    - '# --- build image ---------------------------------------------------'
+    - docker build -f $JOB_DOCKER_BUILD_FILE $(echo $JOB_DOCKER_BUILD_EXTRA_ARGS) -t $JOB_ECR_IMAGE $JOB_DOCKER_BUILD_CONTEXT
+    - ''
+    - '# --- docker push: runtime ---------------------------------------------------'
+    # TODO: don't think this is needed
+    # - eval $(aws ecr get-login-password --no-include-email)
+    - aws ecr create-repository --repository-name $JOB_ECR_NAME || true
+    - docker push $JOB_ECR_IMAGE
+
+.job-build-jira:
+  stage: build
+  extends: .job-build-docker-image
+  variables:
+    JOB_DOCKER_BUILD_EXTRA_ARGS: >-
+      --build-arg BUILD_ID=$CI_PIPELINE_IID
+      --build-arg JIRA_VERSION=$JIRA_APPLICATION_VERSION
+    JOB_DOCKER_BUILD_FILE: jira/Dockerfile
+    JOB_ECR_NAME: $JIRA_ECR_REPO_NAME
+
+
+# ==================================================================== jobs ===
+
+# --------------------------------------------------------------- validate: cloudformation ---
+
+validate-templates:
+  stage: validate
+  extends: .job-validate-templates
+  only:
+    changes:
+      - aws.cfn.*.yml
+  variables:
+    <<: *cwdevpf_na
+
+# ------------------------------------------------------------ deploy: data ---
+
+deploy-data-prod-na:
+  stage: data
+  extends: .job-deploy-data
+  only:
+    - master
+  when: manual
+  variables:
+    <<: *cwprod_na
+
+deploy-data-devpf-na:
+  stage: data
+  extends: .job-deploy-data
+  only:
+    - dev
+  when: manual
+  variables:
+    <<: *cwdevpf_na
+
+deploy-data-sandbox-na:
+  stage: data
+  extends: .job-deploy-data
+  only:
+     - test
+  when: manual
+  variables:
+    <<: *cwdevsb_na
+
+# ------------------------------------------------------------- build: jira ---
+
+build-jira-prod-na:
+  stage: build
+  extends: .job-build-jira
+  only:
+    - master
+  when: manual
+  variables:
+    <<: *cwprod_na
+
+build-jira-devpf-na:
+  stage: build
+  extends: .job-build-jira
+  only:
+    - dev
+  when: manual
+  variables:
+    <<: *cwdevpf_na
+
+build-jira-sandbox-na:
+  stage: build
+  extends: .job-build-jira
+  only:
+    - test
+  when: manual
+  variables:
+    <<: *cwdevsb_na
+
+# ------------------------------------------------------------ deploy: jira ---
+
+deploy-jira-prod-na:
+  stage: deploy
+  extends: .job-deploy-jira
+  only:
+    - master
+  when: manual
+  variables:
+    <<: *cwprod_na
+
+deploy-jira-devpf-na:
+  stage: deploy
+  extends: .job-deploy-jira
+  only:
+    - dev
+  when: manual
+  variables:
+    <<: *cwdevpf_na
+
+deploy-jira-sandbox-na:
+  stage: deploy
+  extends: .job-deploy-jira
+  only:
+     - test
+  when: manual
+  variables:
+    <<: *cwdevsb_na
+

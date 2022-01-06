@@ -1,0 +1,977 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: GitLab CI Runner - App Stack
+
+Parameters:
+
+  GitLabAddress:
+    Description: Gitlab URL
+    Type: String
+    Default: https://gitlab.com
+  GitLabRunnerDockerAuth00:
+    Description: GitLab CI Runner Token
+    Default: ""
+    Type: String
+    NoEcho: true
+  GitLabRunnerToken:
+    Description: GitLab CI Runner Token
+    Type: String
+    NoEcho: true
+  GitLabRunnerTags:
+    Description: List of Tags for Runner (comma seperated w/o spaces)
+    Type: String
+  GitLabRunnerConcurrency:
+    Default: 20
+    Type: Number
+    MinValue: 1
+    MaxValue: 20
+  InstanceKey:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Name to enable RDP access to the instances
+    Default: pf-admin
+  InstanceImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Core-ContainersLatest
+  InstanceSize:
+    Description: Size of the instance(s) for GitLab
+    Type: String
+    Default: m5ad.large
+    AllowedValues:
+      - t3.medium
+      - m5d.large
+      - m5ad.large
+      - m5d.xlarge
+      - m5ad.xlarge
+      - m5d.2xlarge
+      - m5ad.2xlarge
+  AsgMinCount:
+    Description: Number of Default GitLab CI Runners
+    Type: Number
+    Default: 1
+  AsgDesiredCount:
+    Description: Number of Default GitLab CI Runners
+    Type: Number
+    Default: 1
+  CoreArtifactsS3BucketName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-gitlabciwin-core/resources/s3/bucket/artifacts/name
+  CoreAppLogGroupName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-gitlabciwin-core/resources/logs/log-group/app/name
+  CoreMainIamInstanceProfileName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-gitlabciwin-core/resources/iam/instance-profile/main/name
+  VpcNetworkId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Default: /pf-vpcnetwork-default/resources/ec2/vpc/vpc-id
+  VpcNetworkNatSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+    Default: /pf-vpcnetwork-default/resources/ec2/subnet/-/nat-subnets/subnet-ids
+  StackVersion:
+    Type: String
+  StackVersionSha:
+    Type: String
+  StackVersionType:
+    Type: String
+    AllowedValues:
+      - build
+      - release
+
+Conditions:
+
+  IsRelease: !Equals [!Ref StackVersionType, release]
+
+Resources:
+
+  ConfigArtifactsBlobPath:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/config/artifacts/blob/path
+      Type: String
+      Value: !If
+        - IsRelease
+        - !Sub releases/${StackVersion}
+        - !Sub builds/${StackVersionSha}
+
+  GeneralSecGrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: general security group - do not manually edit!
+      VpcId: !Ref VpcNetworkId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-general
+
+  DockerClientConfigSmSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/docker-client-config
+      Description: docker client config
+      SecretString: !Sub '{"auths":{},"credsStore":"custom-login","credHelpers":{"https://index.docker.io/v1/":"custom-login","${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com":"custom-login"}}'
+
+  DockerClientConfigSmResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref DockerClientConfigSmSecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalOrgID: o-rbf9JPuxkhve
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringNotLike:
+                aws:PrincipalArn:
+                  - arn:aws:iam::*:role/aws-reserved/*/AWSReservedSSO_AdministratorAccess_*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:*/pf-gitlabciwin-core-*
+
+  DockerClientCustomConfigSmSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/docker-client-custom-login-config
+      Description: docker client custom login config
+      SecretString: !Sub '{"auths-pool":{"https://index.docker.io/v1/":["${GitLabRunnerDockerAuth00}"]}}'
+
+  DockerClientCustomConfigSmResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref DockerClientCustomConfigSmSecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalOrgID: o-rbf9xbjhve
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource: "*"
+            Condition:
+              StringNotLike:
+                aws:PrincipalArn:
+                  - arn:aws:iam::*:role/aws-reserved/*/AWSReservedSSO_AdministratorAccess_*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:*/pf-gitlabciwin-core-*
+
+  ShellRunnerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref VpcNetworkNatSubnetIds
+      LaunchConfigurationName: !Ref ShellRunnerLaunchConfig
+      MinSize: !Ref AsgMinCount
+      MaxSize: "5"
+      DesiredCapacity: !Ref AsgDesiredCount
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-shell
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref AsgDesiredCount
+        Timeout: PT30M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+
+  DockerRunnerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref VpcNetworkNatSubnetIds
+      LaunchConfigurationName: !Ref DockerRunnerLaunchConfig
+      MinSize: !Ref AsgMinCount
+      MaxSize: "5"
+      DesiredCapacity: !Ref AsgDesiredCount
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-docker
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref AsgDesiredCount
+        Timeout: PT30M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+
+  ShellRunnerLaunchConfig: 
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          config:
+            - 00-ConfigureCWLogs
+            - 02-InstallGit
+            - 05-InstallAWSCLI
+            - 08-InstallDockerLogin
+            - 10-InstallPython
+            - 20-ConfigureDocker
+            - 30-InstallGitlabCi
+            - 40-CreateCleanupScheduledTask
+        00-ConfigureCWLogs:
+          files:
+            C:\Program Files\Amazon\SSM\Plugins\awsCloudWatch\AWS.EC2.Windows.CloudWatch.json:
+              content: !Sub |
+                {
+                  "EngineConfiguration": {
+                      "Components": [
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "ApplicationEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "Application"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SystemEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "System"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SecurityEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "Security"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "EC2ConfigLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "EC2ConfigLog.txt",
+                                  "LogDirectoryPath": "C:\\Program Files\\Amazon\\Ec2ConfigService\\Logs",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-ddTHH:mm:ss.fffZ:"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CfnInitLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "cfn-init.log",
+                                  "LogDirectoryPath": "C:\\cfn\\log",
+                                  "TimeZoneKind": "Local",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss,fff"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CfnHupLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "cfn-hup.log",
+                                  "LogDirectoryPath": "C:\\cfn\\log",
+                                  "TimeZoneKind": "Local",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss,fff"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "IISLogs",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "UTF-8",
+                                  "Filter": "",
+                                  "LineCount": "3",
+                                  "LogDirectoryPath": "C:\\inetpub\\logs\\LogFiles\\W3SVC1",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SnapshotLogs",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "Snapshot.log",
+                                  "LogDirectoryPath": "C:\\Windows\\Temp",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.PerformanceCounterComponent.PerformanceCounterInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "MemoryPerformanceCounter",
+                              "Parameters": {
+                                  "CategoryName": "Memory",
+                                  "CounterName": "Available MBytes",
+                                  "DimensionName": "",
+                                  "DimensionValue": "",
+                                  "InstanceName": "",
+                                  "MetricName": "Memory",
+                                  "Unit": "Megabytes"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchApplicationEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/ApplicationEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchSystemEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/SystemEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchSecurityEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/SecurityEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchEC2ConfigLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/EC2ConfigLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchCfnInitLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/CfnInitLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchCfnHupLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/CfnHupLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchIISLogs",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/IISLogs",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatch.CloudWatchOutputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatch",
+                              "Parameters": {
+                                  "NameSpace": "Windows/Default",
+                                  "Region": "${AWS::Region}"
+                              }
+                          }
+                      ],
+                      "Flows": {
+                          "Flows": [
+                              "ApplicationEventLog,CloudWatchApplicationEventLog",
+                              "SystemEventLog,CloudWatchSystemEventLog",
+                              "SecurityEventLog,CloudWatchSecurityEventLog",
+                              "EC2ConfigLog,CloudWatchEC2ConfigLog",
+                              "CfnInitLog,CloudWatchCfnInitLog",
+                              "CfnHupLog,CloudWatchCfnHupLog",
+                              "IISLogs,CloudWatchIISLogs",
+                              "MemoryPerformanceCounter,CloudWatch"
+                          ]
+                      },
+                      "PollInterval": "00:00:05"
+                  },
+                  "IsEnabled": true
+                }
+          commands:
+            0-enableSSM:
+              command: powershell.exe -Command "Set-Service -Name AmazonSSMAgent -StartupType Automatic"
+              waitAfterCompletion: '0'
+            1-restartSSM:
+              command: powershell.exe -Command "Restart-Service AmazonSSMAgent"
+              waitAfterCompletion: '0'
+
+        02-InstallGit:
+          files:
+            C:\Windows\Temp\Install-Git.ps1:
+              content: |
+                Set-Location 'C:\Windows\Temp';
+                Invoke-WebRequest https://github.com/git-for-windows/git/releases/download/v2.31.0-rc0.windows.1/PortableGit-2.31.0-rc0-64-bit.7z.exe -OutFile git.exe
+                .\git.exe -o "C:/Program Files/Git" -y
+          commands:
+            01_install_git:
+              command: powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\Install-Git.ps1
+              WaitAfterCompletion: '0'
+
+        05-InstallAWSCLI:
+          packages:
+            msi:
+              awscli: "https://awscli.amazonaws.com/AWSCLIV2.msi"
+
+        08-InstallDockerLogin:
+          files:
+            C:\Windows\Temp\Install-DockerCredentialEcrLogin.ps1:
+              content: |
+                New-Item -ItemType Directory -Path "C:\tools"
+                Invoke-WebRequest -Uri "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.5.0/windows-amd64/docker-credential-ecr-login.exe" -OutFile "C:\tools\docker-credential-ecr-login.exe"
+          commands:
+            00_download_dockercredentialecrlogin:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-DockerCredentialEcrLogin.ps1
+              WaitAfterCompletion: '0'
+
+        10-InstallPython:
+          files:
+            C:\Windows\Temp\Download-Python.ps1:
+              content: |
+                Invoke-WebRequest -UseBasicParsing -OutFile C:\Windows\Temp\python-3.9.1-amd64.exe https://www.python.org/ftp/python/3.9.1/python-3.9.1-amd64.exe
+            C:\Windows\Temp\Install-Python.ps1:
+              content: |
+                Set-Location 'C:\Windows\Temp';
+                .\python-3.9.1-amd64.exe /passive InstallAllUsers=1 PrependPath=1 Include_test=0 Include_tcltk=0;
+          commands:
+            00_download_python:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Download-Python.ps1
+              WaitAfterCompletion: '0'
+            01_install_python:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Python.ps1
+              waitAfterCompletion: '0'
+        20-ConfigureDocker:
+          files:
+            C:\Windows\Temp\Download-DockerCustomLogin.ps1:
+              content: !Sub |
+                Set-Location 'C:\docker-helper';
+                aws s3 cp s3://${CoreArtifactsS3BucketName}/${ConfigArtifactsBlobPath.Value}/docker-custom-login.zip C:/docker-helper/docker-custom-login.zip
+                Expand-Archive docker-custom-login.zip
+                Remove-Item docker-custom-login.zip
+            C:\docker-helper\docker-credential-batch-helper.bat:
+              content: |
+                @echo off
+                python C:/docker-helper/docker-custom-login/custom-login.py "%1" "%2"
+            C:\Windows\system32\config\systemprofile\.docker\config.json:
+              content: |
+                {
+                  "HttpHeaders": {
+                    "User-Agent": "Docker-Client/19.03.14 (windows)"
+                  },
+                  "credHelpers": {
+                    "284702229816.dkr.ecr.us-east-1.amazonaws.com": "batch-helper.bat"
+                  },
+                  "credStore":"desktop.exe"
+                }
+          commands:
+            00_get_docker_helper_script:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Download-DockerCustomLogin.ps1
+              waitAfterCompletion: '0'
+
+        30-InstallGitlabCi:
+          files:
+            C:\Windows\Temp\Install-GitLabRunner.ps1:
+              content: |
+                New-Item -ItemType Directory -Path "C:\gitlab-runner\"
+                Invoke-WebRequest -Uri "https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-windows-amd64.exe" -OutFile "C:\gitlab-runner\gitlab-runner.exe"
+            C:\Windows\Temp\Register-GitLabRunner.ps1:
+              content: !Sub |
+                Set-Location 'C:\gitlab-runner';
+
+                $env:RUNNER_EXECUTOR = "shell"
+                $env:RUNNER_SHELL = "powershell"
+
+                $env:RUNNER_NAME = ""
+                $env:REGISTRATION_TOKEN = "${GitLabRunnerToken}"
+                $env:CI_SERVER_URL = "${GitLabAddress}"
+
+                $env:RUNNER_TAG_LIST = "winshell-default,${GitLabRunnerTags}"
+                $env:REGISTER_LOCKED = "false"
+
+                $env:RUNNER_REQUEST_CONCURRENCY = "${GitLabRunnerConcurrency}"
+                $env:RUNNER_BUILDS_DIR = ""
+                $env:RUNNER_CACHE_DIR = ""
+
+                .\gitlab-runner register --non-interactive
+                .\gitlab-runner install
+                .\gitlab-runner start
+          commands:
+            00_install_gitlab_runner:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-GitLabRunner.ps1
+              waitAfterCompletion: '0'
+            01_register_gitlab_runner:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Register-GitLabRunner.ps1
+              waitAfterCompletion: '0'
+
+        40-CreateCleanupScheduledTask:
+          files:
+            C:\Windows\Temp\StorageFullShutdown.ps1:
+              content: |
+                # Deleting the windowndfilter folder is on par with reinstalling docker. See four year old KI docker can't seem to fix
+                #   https://github.com/moby/moby/issues/26873
+                #   the ci-zap doesn't work and is pretty destructive. A typo can blow away your file system
+                # If the drive is over 90% and the docker process is idle, the machine terminates itself
+
+                Start-Transcript -Append -Path 'C:/Windows/Temp/StorageFullShutdown.log'
+                $FreeSpaceInGB=$((Get-CimInstance -ClassName Win32_LogicalDisk | Select-Object -Property DeviceID,FreeSpace).FreeSpace / 1GB)
+                Write-Output "$((Get-Date).ToString("HH:mm:ss")) - $FreeSpaceInGB GB of free space remaining on drive"
+
+                If($FreeSpaceInGB -lt 15) {
+                  Write-Output "$((Get-Date).ToString("HH:mm:ss")) - Free space below limit. Checking docker running status."
+                  $dockerProcessCheck=$(docker ps -f "status=running" --format '{{.Names}}')
+                  if($dockerProcessCheck){
+                    Write-Output "$((Get-Date).ToString("HH:mm:ss")) - Delaying start becasue of running docker process."
+                  }
+                  else {
+                    # Cycle out and let ASG autoreplace
+                    $instanceid = invoke-restmethod -URI 'http://169.254.169.254/latest/meta-data/instance-id'
+                    aws ec2 terminate-instances --instance-ids $instanceid
+                  }
+                }
+            C:\Windows\Temp\ScheduleStorageStatusCheck.ps1:
+              content: |
+                $Action = New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument '-noprofile -executionpolicy unrestricted -noninteractive -file C:\Windows\Temp\StorageFullShutdown.ps1'
+                $tspan=New-TimeSpan -Minutes 60
+                $Trigger = New-ScheduledTaskTrigger -Once -At 12:45pm -RepetitionInterval $tspan
+                $Settings = New-ScheduledTaskSettingsSet
+                $Task = New-ScheduledTask -Action $Action -Trigger $Trigger -Settings $Settings
+                Register-ScheduledTask -Action $Action -Trigger $Trigger -TaskPath "TASK-FOLDER" -TaskName "remove-full-drive" -Description "Removes the machine when windowsfilters is full"
+          commands:
+            00_install_gitlab_runner:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\ScheduleStorageStatusCheck.ps1
+              waitAfterCompletion: '0'                    
+
+    Properties:
+      ImageId: !Ref InstanceImageId
+      KeyName: !Ref InstanceKey
+      InstanceType: !Ref InstanceSize
+      BlockDeviceMappings:
+       - DeviceName: /dev/sda1
+         Ebs:
+          VolumeSize: 120
+      EbsOptimized: true
+      IamInstanceProfile: !Ref CoreMainIamInstanceProfileName
+      SecurityGroups:
+        - !Ref GeneralSecGrp
+      UserData:
+        Fn::Base64: !Sub |
+            <powershell>
+              $env:Path = "$env:Path;C:\gitlab-runner"
+              $env:Path = "$env:Path;C:\tools"
+              $env:Path = "$env:Path;C:\docker-helper"
+              $env:Path = "$env:Path;C:\Program Files\docker"
+              $env:Path = "$env:Path;C:\Program Files\Git"
+              $env:Path = "$env:Path;C:\Program Files\Git\bin"
+              $env:Path = "$env:Path;C:\Program Files\Amazon\AWSCLIV2"
+              $env:Path = "$env:Path;C:\Program Files\Python39"
+              [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine);
+
+              # create sched proc logger file
+              New-Item -Path 'C:/Windows/Temp/' -Name 'StorageFullShutdown.log' -ItemType "file"
+
+              cfn-init.exe -v -c config --stack ${AWS::StackName} --resource ShellRunnerLaunchConfig --region ${AWS::Region}
+              cfn-signal.exe -e $lastexitcode --stack ${AWS::StackName} --resource ShellRunnerAutoScalingGroup  --region ${AWS::Region}
+
+            </powershell>
+
+  DockerRunnerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          config:
+            - 00-ConfigureCWLogs
+            - 05-InstallAWSCLI
+            - 08-InstallDockerLogin
+            - 10-InstallPython
+            - 20-ConfigureDocker
+            - 30-InstallGitlabCi
+        00-ConfigureCWLogs:
+          files:
+            C:\Program Files\Amazon\SSM\Plugins\awsCloudWatch\AWS.EC2.Windows.CloudWatch.json:
+              content: !Sub |
+                {
+                  "EngineConfiguration": {
+                      "Components": [
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "ApplicationEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "Application"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SystemEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "System"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SecurityEventLog",
+                              "Parameters": {
+                                  "Levels": "7",
+                                  "LogName": "Security"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "EC2ConfigLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "EC2ConfigLog.txt",
+                                  "LogDirectoryPath": "C:\\Program Files\\Amazon\\Ec2ConfigService\\Logs",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-ddTHH:mm:ss.fffZ:"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CfnInitLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "cfn-init.log",
+                                  "LogDirectoryPath": "C:\\cfn\\log",
+                                  "TimeZoneKind": "Local",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss,fff"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CfnHupLog",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "cfn-hup.log",
+                                  "LogDirectoryPath": "C:\\cfn\\log",
+                                  "TimeZoneKind": "Local",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss,fff"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "IISLogs",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "UTF-8",
+                                  "Filter": "",
+                                  "LineCount": "3",
+                                  "LogDirectoryPath": "C:\\inetpub\\logs\\LogFiles\\W3SVC1",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "SnapshotLogs",
+                              "Parameters": {
+                                  "CultureName": "en-US",
+                                  "Encoding": "ASCII",
+                                  "Filter": "Snapshot.log",
+                                  "LogDirectoryPath": "C:\\Windows\\Temp",
+                                  "TimeZoneKind": "UTC",
+                                  "TimestampFormat": "yyyy-MM-dd HH:mm:ss"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.PerformanceCounterComponent.PerformanceCounterInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "MemoryPerformanceCounter",
+                              "Parameters": {
+                                  "CategoryName": "Memory",
+                                  "CounterName": "Available MBytes",
+                                  "DimensionName": "",
+                                  "DimensionValue": "",
+                                  "InstanceName": "",
+                                  "MetricName": "Memory",
+                                  "Unit": "Megabytes"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.PerformanceCounterComponent.PerformanceCounterInputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "PerformanceCounterDisk",
+                              "Parameters": {
+                                  "CategoryName": "LogicalDisk",
+                                  "CounterName": "% Free Space",
+                                  "InstanceName": "C:",
+                                  "MetricName": "FreeDiskPercentage",
+                                  "Unit": "Percent",
+                                  "DimensionName": "InstanceId",
+                                  "DimensionValue": "{instance_id}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchApplicationEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/ApplicationEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchSystemEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/SystemEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchSecurityEventLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/SecurityEventLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchEC2ConfigLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/EC2ConfigLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchCfnInitLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/CfnInitLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchCfnHupLog",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/CfnHupLog",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatchIISLogs",
+                              "Parameters": {
+                                  "StackLogGroup": "${CoreAppLogGroupName}",
+                                  "LogStream": "{instance_id}/IISLogs",
+                                  "Region": "${AWS::Region}"
+                              }
+                          },
+                          {
+                              "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatch.CloudWatchOutputComponent,AWS.EC2.Windows.CloudWatch",
+                              "Id": "CloudWatch",
+                              "Parameters": {
+                                  "NameSpace": "Windows/Default",
+                                  "Region": "${AWS::Region}"
+                              }
+                          }
+                      ],
+                      "Flows": {
+                          "Flows": [
+                              "ApplicationEventLog,CloudWatchApplicationEventLog",
+                              "SystemEventLog,CloudWatchSystemEventLog",
+                              "SecurityEventLog,CloudWatchSecurityEventLog",
+                              "EC2ConfigLog,CloudWatchEC2ConfigLog",
+                              "CfnInitLog,CloudWatchCfnInitLog",
+                              "CfnHupLog,CloudWatchCfnHupLog",
+                              "IISLogs,CloudWatchIISLogs",
+                              "MemoryPerformanceCounter,CloudWatch",
+                              "CloudWatchLogs","PerformanceCounter,PerformanceCounterDisk"
+                          ]
+                      },
+                      "PollInterval": "00:00:05"
+                  },
+                  "IsEnabled": true
+                }
+          commands:
+            0-enableSSM:
+              command: powershell.exe -Command "Set-Service -Name AmazonSSMAgent -StartupType Automatic"
+              waitAfterCompletion: '0'
+            1-restartSSM:
+              command: powershell.exe -Command "Restart-Service AmazonSSMAgent"
+              waitAfterCompletion: '0'
+
+        05-InstallAWSCLI:
+          packages:
+            msi:
+              awscli: "https://awscli.amazonaws.com/AWSCLIV2.msi"
+
+        08-InstallDockerLogin:
+          files:
+            C:\Windows\Temp\Install-DockerCredentialEcrLogin.ps1:
+              content: |
+                New-Item -ItemType Directory -Path "C:\tools"
+                Invoke-WebRequest -Uri "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.5.0/windows-amd64/docker-credential-ecr-login.exe" -OutFile "C:\tools\docker-credential-ecr-login.exe"
+          commands:
+            00_download_dockercredentialecrlogin:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-DockerCredentialEcrLogin.ps1
+              WaitAfterCompletion: '0'
+
+        10-InstallPython:
+          files:
+            C:\Windows\Temp\Download-Python.ps1:
+              content: |
+                Invoke-WebRequest -UseBasicParsing -OutFile C:\Windows\Temp\python-3.9.1-amd64.exe https://www.python.org/ftp/python/3.9.1/python-3.9.1-amd64.exe
+            C:\Windows\Temp\Install-Python.ps1:
+              content: |
+                Set-Location 'C:\Windows\Temp';
+                .\python-3.9.1-amd64.exe /passive InstallAllUsers=1 PrependPath=1 Include_test=0 Include_tcltk=0;
+          commands:
+            00_download_python:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Download-Python.ps1
+              WaitAfterCompletion: '0'
+            01_install_python:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Python.ps1
+              waitAfterCompletion: '0'
+
+        20-ConfigureDocker:
+          files:
+            C:\Windows\Temp\Download-DockerCustomLogin.ps1:
+              content: !Sub |
+                Set-Location 'C:\docker-helper';
+                aws s3 cp s3://${CoreArtifactsS3BucketName}/${ConfigArtifactsBlobPath.Value}/docker-custom-login.zip C:/docker-helper/docker-custom-login.zip
+                Expand-Archive docker-custom-login.zip
+                Remove-Item docker-custom-login.zip
+            C:\docker-helper\docker-credential-batch-helper.bat:
+              content: |
+                @echo off
+                python C:/docker-helper/docker-custom-login/custom-login.py "%1" "%2"
+            C:\Windows\system32\config\systemprofile\.docker\config.json:
+              content: |
+                {
+                  "HttpHeaders": {
+                    "User-Agent": "Docker-Client/19.03.14 (windows)"
+                  },
+                  "credHelpers": {
+                    "284702229816.dkr.ecr.us-east-1.amazonaws.com": "batch-helper.bat"
+                  },
+                  "credStore":"desktop.exe"
+                }
+          commands:
+            00_get_docker_helper_script:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Download-DockerCustomLogin.ps1
+              waitAfterCompletion: '0'
+
+        30-InstallGitlabCi:
+          files:
+            C:\Windows\Temp\Install-GitLabRunner.ps1:
+              content: |
+                New-Item -ItemType Directory -Path "C:\gitlab-runner\"
+                Invoke-WebRequest -Uri "https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-windows-amd64.exe" -OutFile "C:\gitlab-runner\gitlab-runner.exe"
+            C:\Windows\Temp\Register-GitLabRunner.ps1:
+              content: !Sub |
+                Set-Location 'C:\gitlab-runner';
+                $env:RUNNER_EXECUTOR = "docker-windows"
+                $env:RUNNER_SHELL = "powershell"
+                $env:DOCKER_IMAGE = "mcr.microsoft.com/windows/servercore:1809"   # TODO: ?
+                $env:RUNNER_NAME = ""
+                $env:REGISTRATION_TOKEN = "${GitLabRunnerToken}"
+                $env:CI_SERVER_URL = "${GitLabAddress}"
+                $env:RUNNER_TAG_LIST = "windocker-default,${GitLabRunnerTags}"
+                $env:REGISTER_LOCKED = "false"
+
+                $env:RUNNER_REQUEST_CONCURRENCY = "${GitLabRunnerConcurrency}"
+                $env:RUNNER_BUILDS_DIR = ""
+                $env:RUNNER_CACHE_DIR = ""
+
+                .\gitlab-runner register --non-interactive
+                .\gitlab-runner install
+                .\gitlab-runner start
+          commands:
+            00_install_gitlab_runner:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-GitLabRunner.ps1
+              waitAfterCompletion: '0'
+            01_register_gitlab_runner:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Register-GitLabRunner.ps1
+              waitAfterCompletion: '0'
+
+    Properties:
+      ImageId: !Ref InstanceImageId
+      KeyName: !Ref InstanceKey
+      InstanceType: !Ref InstanceSize
+      BlockDeviceMappings:
+       - DeviceName: /dev/sda1
+         Ebs:
+          VolumeSize: 120
+      EbsOptimized: true
+      IamInstanceProfile: !Ref CoreMainIamInstanceProfileName
+      SecurityGroups:
+        - !Ref GeneralSecGrp
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+          $chocoInstall = New-TemporaryFile
+          'Installing chocolatey package manager.'
+          'Check version with `choco.exe --version`.'
+          [Net.WebClient]::new().DownloadString(
+              'https://chocolatey.org/install.ps1'
+          ) | Out-File -FilePath $chocoInstall.FullName -Encoding UTF8
+          . $chocoInstall.FullName
+
+          'Chocolatey installed. Installing NodeJS and NPM via Chocolatey.'
+          & "$Env:ProgramData\chocolatey\choco.exe" install nodejs --yes --force
+
+          'Installation complete.'
+          $url = "https://download.visualstudio.microsoft.com/download/pr/9fcc1f0c-c63f-4424-bc46-7351a59fba06/1ed7863dc633c57c42a88c5cef907048/vs_community.exe"
+          New-Item -Path 'C:\dev\pub\vs' -ItemType Directory -force
+          $downloadPath = "C:\dev\pub\vs"
+          $filePath = "C:\dev\pub\vs\vs_community.exe"
+          Invoke-WebRequest -URI $url -OutFile $filePath
+          powershell -command '& "C:\dev\pub\vs\vs_community.exe" --installPath C:\minVS --add Microsoft.VisualStudio.Workload.CoreEditor --passive --norestart'
+          $source = "http://rarlab.com/rar/winrar-x64-540.exe"
+          $destination = "$workdir\winrar.exe"
+          Invoke-WebRequest $source -OutFile $destination
+          Start-Process -FilePath "$workdir\winrar.exe" -ArgumentList "/S"
+          $code_path="C:\minVS\Common7\IDE\devenv.exe"
+          Start-Process -FilePath $code_path
+          
+          </powershell>
+
+# -------------------------------------------------------------- parameters ---
+
+  ParameterGeneralSecGrpId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/ec2/security-group/general/group-id
+      Type: String
+      Value: !Sub ${GeneralSecGrp.GroupId}
+
+  ParameterGeneralSecGrpName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/ec2/security-group/general/group-name
+      Type: String
+      Value: !Sub ${GeneralSecGrp}

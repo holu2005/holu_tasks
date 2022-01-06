@@ -1,0 +1,62 @@
+        43-InstallWixTools:
+          files:
+            C:\Windows\Temp\Install-Tools.ps1:
+              content: |
+                Set-Location 'C:\Windows\Temp';
+                # .\wix3104.exe /install /quiet /norestart
+                Start-Process -FilePath ./babel_x64_8.16.0.4_company.msi -ArgumentList "/quiet"
+          commands:
+            01_install_tools:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Install-Tools.ps1
+              waitAfterCompletion: '0'
+
+        44-InstallNode:
+          files:
+            C:\Windows\Temp\Download-Node.ps1:
+              content: |
+                Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+                $chocoInstall = New-TemporaryFile
+                'Installing chocolatey package manager.'
+                'Check version with `choco.exe --version`.'
+                [Net.WebClient]::new().DownloadString('https://chocolatey.org/install.ps1') | Out-File -FilePath $chocoInstall.FullName -Encoding UTF8
+                'Chocolatey installed. Installing NodeJS and NPM via Chocolatey.'
+                & "$env:ProgramData\chocolatey\choco.exe" install nodejs --yes --force
+          commands:
+            00_download_node:
+              command: powershell -ExecutionPolicy ByPass -File C:\Windows\Temp\Download-Node.ps1
+              waitAfterCompletion: '0'
+              Install-WindowsFeature Net-Framework-Core -source \\network\share\sxs
+              Copy-S3Object -BucketName ${CoreArtifactsS3BucketName} -KeyPrefix "/setups/" -LocalFolder C:\Windows\Temp\
+              powershell -command C:\Windows\Temp\wix311.exe /install /quiet /norestart
+    
+    Properties:
+      ImageId: !Ref InstanceImageId
+      KeyName: !Ref InstanceKey
+      InstanceType: !Ref InstanceSize
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 120
+      EbsOptimized: true
+      IamInstanceProfile: !Ref CoreMainIamInstanceProfileName
+      SecurityGroups:
+        - !Ref GeneralSecGrp
+      UserData:
+        'Fn::Base64': !Sub |
+          <powershell>
+            $env:Path = "$env:Path;C:\gitlab-runner"
+            $env:Path = "$env:Path;C:\tools"
+            $env:Path = "$env:Path;C:\docker-helper"
+            $env:Path = "$env:Path;C:\Program Files\docker"
+            $env:Path = "$env:Path;C:\Program Files\Git"
+            $env:Path = "$env:Path;C:\Program Files\Git\bin"
+            $env:Path = "$env:Path;C:\Program Files\Amazon\AWSCLIV2"
+            $env:Path = "$env:Path;C:\Program Files\Python39"
+            $env:Path = "$env:Path;C:\Program Files\nodejs"
+            [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine);
+
+            # create sched proc logger file
+            New-Item -Path 'C:/Windows/Temp/' -Name 'StorageFullShutdown.log' -ItemType "file"
+            cfn-init.exe -v -c config --stack ${AWS::StackName} --resource ShellRunnerLaunchConfig --region ${AWS::Region}
+            cfn-signal.exe -e $lastexitcode --stack ${AWS::StackName} --resource ShellRunnerAutoScalingGroup  --region ${AWS::Region}
+          </powershell>

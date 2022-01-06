@@ -1,0 +1,502 @@
+# ================================================================== config ===
+
+stages:
+  # ci pipeline
+  - build           # build all artifacts
+  - test            # scan and test artifacts
+  - sandbox         # deploy sandbox runner
+  - release         # tag commit with version and bump versioning
+  # cd pipeline
+  - publish         # publish all artifacts
+  - nonstd:approve  # approval for deployment to non-std runners
+  - nonstd          # deploy non-std runners
+  - std:approve     # approval for deployment to std runners
+  - std             # deploy std runners
+  # tasks
+  - task:s00
+
+variables:
+  ACCOUNT_CLDMNGMT_STACK_NAME: pf-cloudmanagement-v1
+  ARTIFACT_AWS_ACCESS_KEY_ID: $CWCLOUDPLATFORM_AWS_ACCESS_KEY_ID
+  ARTIFACT_AWS_SECRET_ACCESS_KEY: $CWCLOUDPLATFORM_AWS_SECRET_ACCESS_KEY
+  BILLING_TAG_BUSINESS_UNIT: corporate
+  BILLING_TAG_DEPARTMENT: platform
+  BILLING_TAG_PRODUCT: platform
+  BILLING_TAG_CLASS: software
+  BILLING_TAG_SUBCLASS: operations
+  STACK_SERVICE_NAME: pf-gitlabciwin
+  SECURE_ANALYZERS_PREFIX: registry.gitlab.com/gitlab-org/security-products/analyzers
+  SECURE_LOG_LEVEL: trace
+
+default:
+  tags:
+    - default
+  before_script:
+    - '# --- print ci variables ----------------------------------------------'
+    - printenv | grep -E "^(CI_|GITLAB_)" | sort
+    - ''
+    - '# --- install dependencies --------------------------------------------'
+    - apk add --no-cache bash curl git jq python3 py3-pip
+    - pip3 install awscli boto3 python-gitlab
+    - ''
+    - '#--- print deployer user info -----------------------------------------'
+    - aws sts get-caller-identity
+    - ''
+    - '# --- add ci scripts --------------------------------------------------'
+    - chmod 777 devops/ci/*
+    - export PATH=$(pwd)/devops/ci:$PATH
+    - ''
+    - '# --- set shared variables ----------------------------------------------'
+    - export ACCOUNT_LEVEL=$(aws ssm get-parameter --name /$ACCOUNT_CLDMNGMT_STACK_NAME/meta/account/level --query 'Parameter.Value' --output text)
+    - export ACCOUNT_TYPE=$(aws ssm get-parameter --name /$ACCOUNT_CLDMNGMT_STACK_NAME/meta/account/type --query 'Parameter.Value' --output text)
+    - export CORE_STACK_NAME=$STACK_SERVICE_NAME-core
+    - export CORE_STACK_ARTIFACT_S3_BUCKET=$(aws ssm get-parameter --name /$CORE_STACK_NAME/resources/s3/bucket/artifacts/name --query 'Parameter.Value' --output text)
+    - export STACK_VERSION_BUILD=$(semver bump build $CI_PIPELINE_IID $(cat .version))
+    - export STACK_VERSION_RELEASE=$(cat .version)
+    - export STACK_EC2_KEY_NAME=$(aws ssm get-parameter --name /pf-gitlabciwin-core/unmanaged-resources/ec2/key-pair/default/name --query 'Parameter.Value' --output text)
+    - ''
+  after_script:
+    - '# --- print build ids -------------------------------------------------'
+    - printenv | grep -E "^(CI_PIPELINE_ID|CI_PIPELINE_IID)" | sort
+
+# =============================================================== variables ===
+
+.vars-account:
+
+  # ----------------------------------------------------- accounts: sandbox ---
+
+  .vars-account-cwdevsandbox: &account_cwdevsandbox
+    AWS_ACCESS_KEY_ID: $CWDEVSANDBOX_AWS_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY: $CWDEVSANDBOX_AWS_SECRET_ACCESS_KEY
+
+  # ------------------------------------------------------- accounts: prod ---
+
+  .vars-account-cwcloudplatform: &account_cwcloudplatform
+    AWS_ACCESS_KEY_ID: $CWCLOUDPLATFORM_AWS_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY: $CWCLOUDPLATFORM_AWS_SECRET_ACCESS_KEY
+
+  # --------------------------------------------------------------  regions ---
+
+  .vars-region-use1: &region_use1
+    AWS_DEFAULT_REGION: us-east-1
+    REGION_TERRITORY: connect_us
+
+
+# =============================================================== templates ===
+
+.job-build-package:
+  image: 284702229346.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default-loaded:v1
+  services:
+    - docker:dind
+  variables:
+    DOCKER_BUILDKIT: 1
+    JOB_DOCKER_BUILD_CONTEXT: "."
+    JOB_DOCKER_BUILD_FILE: Dockerfile
+    JOB_DOCKER_BUILD_EXTRA_ARGS: ""
+    JOB_PACKAGE_FILE_NAME: package.zip
+  script:
+    - "# --- set variables ---------------------------------------------------"
+    - export JOB_DOCKER_IMAGE_PACKAGE=package:local
+    - export JOB_DOCKER_CONTAINER_NAME=package
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MAIN_)" | sort
+    - ""
+    - "# --- build & package -------------------------------------------------"
+    - >-
+      docker build -f $JOB_DOCKER_BUILD_CONTEXT/$JOB_DOCKER_BUILD_FILE
+      --target package
+      $(echo $JOB_DOCKER_BUILD_EXTRA_ARGS)
+      -t $JOB_DOCKER_IMAGE_PACKAGE $JOB_DOCKER_BUILD_CONTEXT
+    - ""
+    - "# --- retrieve package ------------------------------------------------"
+    - docker run --name $JOB_DOCKER_CONTAINER_NAME $JOB_DOCKER_IMAGE_PACKAGE /bin/true
+    - docker cp $JOB_DOCKER_CONTAINER_NAME:/tmp/package.zip package.zip
+    - docker rm -f $JOB_DOCKER_CONTAINER_NAME
+    - ""
+    - "# --- publish package -------------------------------------------------"
+    - aws s3 cp package.zip s3://$CORE_STACK_ARTIFACT_S3_BUCKET/builds/$CI_COMMIT_SHA/$JOB_PACKAGE_FILE_NAME
+    - ""
+  artifacts:
+    name: package-$CI_PIPELINE_IID
+    paths:
+      - package.zip
+
+.job-build-blob-files:
+  image: 284702229816.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default-loaded:v1
+  variables:
+    JOB_SOURCE_DIR: .
+    JOB_DESTINATION_DIR: repo
+  script:
+    - "# --- set variables ---------------------------------------------------"
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MAIN_)" | sort
+    - ""
+    - "# --- publish package -------------------------------------------------"
+    - aws s3 sync $JOB_SOURCE_DIR s3://$CORE_STACK_ARTIFACT_S3_BUCKET/builds/$CI_COMMIT_SHA/$JOB_DESTINATION_DIR/ --delete
+    - ""
+
+.job-test-templates:
+  script:
+    - "# --- set variables -----------------------------------------------------"
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MNGMNT_|CLUSTER_)" | sort
+    - ""
+    - "# --- validate template -------------------------------------------------"
+    - for template in aws.cfn.*.yml; do aws cloudformation validate-template --template-body file://$template; done
+    - ""
+
+.job-test-secrets:
+  image: $SECURE_ANALYZERS_PREFIX/secrets:3
+  script:
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        git fetch origin $CI_DEFAULT_BRANCH $CI_BUILD_REF_NAME
+        export SECRET_DETECTION_COMMIT_TO=$(git log --left-right --cherry-pick --pretty=format:"%H" refs/remotes/origin/$CI_DEFAULT_BRANCH...refs/remotes/origin/$CI_BUILD_REF_NAME | tail -n 1)
+        export SECRET_DETECTION_COMMIT_FROM=$CI_COMMIT_SHA
+      fi
+    - /analyzer run
+  artifacts:
+    reports:
+      secret_detection: gl-secret-detection-report.json
+    expire_in: 4 weeks
+
+.job-test-license:
+  image:
+    name: $SECURE_ANALYZERS_PREFIX/license-finder:3
+    entrypoint: [""]
+  variables:
+    LM_REPORT_VERSION: "2.1"
+  before_script:
+    - ""
+  script:
+    - printf "machine gitlab.connectwisedev.com\nlogin $BOT_GITLAB_USERNAME\npassword $BOT_GITLAB_TOKEN" >> ~/.netrc
+    - /run.sh analyze .
+  artifacts:
+    reports:
+      license_scanning: gl-license-scanning-report.json
+    expire_in: 4 weeks
+
+.job-test-versioning:
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - export JOB_TEST_TYPE=$([ $CI_COMMIT_REF_SLUG == hotfix-* ] && echo "patch" || echo "major or minor")
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MNGMNT_|CLUSTER_)" | sort
+    - ''
+    - '# --- bump versioning -------------------------------------------------'
+    - git fetch --tags
+    - |
+      if [ $(git tag -l "v$STACK_VERSION_RELEASE") ]; then
+        echo "failed: version ${STACK_VERSION_RELEASE} exists; increment '${JOB_TEST_TYPE}' version in .version file"
+        exit 1
+      else
+        echo "success"
+      fi
+
+.job-deploy-runner:
+  tags:
+    - default
+  variables:
+    APP_GITLAB_URL: https://gitlab.connecdev.com
+    APP_CONCURRENCY: 1
+    APP_DESIRED_COUNT: 1
+    APP_MIN_COUNT: 1
+    APP_INSTANCE_SIZE: m5ad.large
+    APP_STACK_TEIR_PATTERN: default
+    APP_STACK_TARGETED_VERSION: release
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - export APP_STACK_TIER=$(echo "$STACK_VERSION_RELEASE" | sed -r "s/^[vV]*(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/$APP_STACK_TEIR_PATTERN/")
+    - export APP_STACK_NAME=$STACK_SERVICE_NAME-$APP_STACK_TIER
+    - printenv | grep -E "^(CORE_|BILLING_|ACCOUNT_|REGION_|STACK_|JOB_|APP_)" | sort
+    - ''
+    - "# --- sync artifacts --------------------------------------------------"
+    - |
+      if [ "$APP_STACK_TARGETED_VERSION" == "release" ]; then
+        ./devops/ci/pull_release_blobs
+      fi
+    - '# --- deploy changes --------------------------------------------------'
+    - >-
+      aws cloudformation deploy --stack-name $APP_STACK_NAME --template-file aws.cfn.app.yml
+      --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
+      --parameter-overrides
+      ArtifactS3Bucket=$GITLAB_CORE_STACK_S3_ARTIFACT_BUCKET
+      AsgDesiredCount=$APP_DESIRED_COUNT
+      AsgMinCount=$APP_MIN_COUNT
+      GitLabAddress=$APP_GITLAB_URL
+      GitLabRunnerConcurrency=$APP_CONCURRENCY
+      GitLabRunnerDockerAuth00=$RUNNER_DOCKER_AUTH_00
+      GitLabRunnerToken=$RUNNER_TOKEN
+      GitLabRunnerTags=$APP_STACK_CI_TAGS
+      InstanceKey=$STACK_EC2_KEY_NAME
+      InstanceSize=$APP_INSTANCE_SIZE
+      StackVersion=$STACK_VERSION_RELEASE
+      StackVersionSha=$CI_COMMIT_SHA
+      StackVersionType=$APP_STACK_TARGETED_VERSION
+      --tags
+      service_name=$STACK_SERVICE_NAME
+      territory=$REGION_TERRITORY
+      region=$AWS_DEFAULT_REGION
+      business_unit=$BILLING_TAG_BUSINESS_UNIT
+      department=$BILLING_TAG_DEPARTMENT
+      product=$BILLING_TAG_PRODUCT
+      class=$BILLING_TAG_CLASS
+      subclass=$BILLING_TAG_SUBCLASS
+      cw:devops:branch=$CI_COMMIT_REF_SLUG
+      cw:devops:build=$CI_PIPELINE_IID.$CI_PIPELINE_ID
+      cw:devops:project-url=$CI_PROJECT_URL
+      cw:devops:ci=true
+
+.job-release-build:
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        export JOB_BUMP_TYPE="minor"
+      elif [ "$CI_COMMIT_BRANCH" = "release-*" ]; then
+        export JOB_BUMP_TYPE="patch"
+      else
+        export JOB_BUMP_TYPE="none"
+      fi
+    - export JOB_RELEASE_TAG=v$STACK_VERSION_RELEASE
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MNGMNT_|CLUSTER_)" | sort
+    - ''
+    - '# --- add version tag -------------------------------------------------'
+    - >-
+      curl --request POST --header "PRIVATE-TOKEN: $BOT_GITLAB_TOKEN"
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/tags?tag_name=$JOB_RELEASE_TAG&ref=$CI_COMMIT_SHA"
+    - ''
+    - '# --- add bump versioning ---------------------------------------------'
+    - git fetch --tags
+    - |
+      if [[ "$JOB_BUMP_TYPE" == "none" ]]; then
+        echo "no automated version bump for this branch"
+      else
+        export JOB_COMMIT_ID=$(git rev-parse HEAD)
+        export JOB_VERSION_RELEASE_BUMPED=$(semver bump $JOB_BUMP_TYPE $STACK_VERSION_RELEASE)
+        printenv | grep -E "^(JOB_)" | sort
+        curl --request POST --header "PRIVATE-TOKEN: $BOT_GITLAB_TOKEN" \
+        --form "branch=$CI_COMMIT_BRANCH" \
+        --form "commit_message=automated version bump" \
+        --form "actions[][action]=update" \
+        --form "actions[][file_path]=.version" \
+        --form "actions[][content]=$JOB_VERSION_RELEASE_BUMPED" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits"
+      fi
+    - ''
+
+.job-approve-deployment:
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MNGMNT_|CLUSTER_)" | sort
+    - ''
+
+.job-publish-artifact-blob:
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - printenv | grep -E "^(ACCOUNT_|BILLING_|CORE_|STACK_|JOB_|MAIN_)" | sort
+    - ''
+    - "# --- publish package -------------------------------------------------"
+    - ./devops/ci/publish_rc_blobs
+    - ""
+
+# =================================================================== tasks ===
+
+task:demo-job:
+  image: 284702229346.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default-loaded:v1
+  stage: task:s00
+  services:
+    - docker:stable-dind
+  tags:
+    - cwdevsandbox-use1
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+      when: never
+    - if: $JOB_TASK == "demo-job"
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+    APP_STACK_TARGETED_VERSION: build
+  before_script:
+    - '# --- print ci variables ----------------------------------------------'
+    - printenv | grep -E "^(CI_|GITLAB_)" | sort
+    - ''
+    - '#--- print deployer user info -----------------------------------------'
+    - aws sts get-caller-identity
+    - ''
+    - '# --- set shared variables --------------------------------------------'
+    - export ACCOUNT_LEVEL=$(aws ssm get-parameter --name /$ACCOUNT_CLDMNGMT_STACK_NAME/meta/account/level --query 'Parameter.Value' --output text)
+    - export ACCOUNT_TYPE=$(aws ssm get-parameter --name /$ACCOUNT_CLDMNGMT_STACK_NAME/meta/account/type --query 'Parameter.Value' --output text)
+    - export CORE_STACK_NAME=$STACK_SERVICE_NAME-core
+    - export STACK_VERSION_BUILD=$(semver bump build $CI_PIPELINE_IID $(cat .version))
+    - export STACK_VERSION_RELEASE=$(cat .version)
+    - ''
+  script:
+    - '# --- set variables ---------------------------------------------------'
+    - printenv | grep -E "^(ACCOUNT_|REGION_|BILLING_|STACK_|JOB_|APP_)" | sort
+    - ''
+    - '# --- demo before script ----------------------------------------------'
+    - ls -la /tmp
+    - ls -la /root/.docker/ || true
+    - cat /tmp/config.json || true
+    - cat /root/.docker/config.json || true
+    - ''
+    - '# --- test docker ecr login helper ------------------------------------'
+    - docker login 284702229346.dkr.ecr.us-east-1.amazonaws.com
+    - docker pull 284702229346.dkr.ecr.us-east-1.amazonaws.com/pf-cicdenvs-core/default-loaded:v1 || true
+    - cat ~/.ecr/log/ecr-login.log
+    - cat /root/.docker/config.json || true
+    - ''
+
+# ============================================================= ci-pipeline ===
+
+# ------------------------------------------------------------ stage: build ---
+
+build:docker-custom-login:
+  stage: build
+  extends: .job-build-package
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+    JOB_DOCKER_BUILD_FILE: src/docker-custom-login/Dockerfile
+    JOB_PACKAGE_FILE_NAME: docker-custom-login.zip
+
+# ------------------------------------------------------------- stage: test ---
+
+test:cfn:
+  stage: test
+  extends: .job-test-templates
+  needs: []
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+    AWS_DEFAULT_REGION: us-east-1
+
+test:license:
+  stage: test
+  extends: .job-test-license
+  allow_failure: true
+  needs: []
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+
+test:secrets:
+  stage: test
+  extends: .job-test-secrets
+  allow_failure: true
+  needs: []
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+
+test:versioning:
+  stage: test
+  extends: .job-test-versioning
+  allow_failure: false
+  needs: []
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+
+# ----------------------------------------------------------- stage: sandbox ---
+
+sandbox:runner:
+  stage: sandbox
+  extends: .job-deploy-runner
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+    APP_STACK_TEIR_PATTERN: test
+    APP_STACK_CI_TAGS: win-cwdevsandbox-use1
+    APP_STACK_TARGETED_VERSION: build
+    APP_DESIRED_COUNT: 0
+    APP_MIN_COUNT: 0
+
+# ---------------------------------------------------------- stage: release ---
+
+release:build:
+  stage: release
+  extends: .job-release-build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH =~ /^hotfix-/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH =~ /^release-/
+      when: manual
+      allow_failure: false
+  variables:
+    <<: *account_cwcloudplatform
+
+# ============================================================= cd-pipeline ===
+
+# ---------------------------------------------------------- stage: publish ---
+
+publish:blob:
+  stage: publish
+  extends: .job-publish-artifact-blob
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[vV](0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+  variables:
+    <<: *account_cwdevsandbox
+    <<: *region_use1
+
+# -------------------------------------------------------------- stage: std ---
+
+std:approve:
+  stage: std:approve
+  extends: .job-approve-deployment
+  tags:
+    - cwprod-use1 # use non-default runner
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[vV](0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+      when: manual
+  variables:
+    <<: *account_cwcloudplatform
+  environment:
+    name: nonstd
+
+std:runner:default:use1:
+  stage: std
+  extends: .job-deploy-runner
+  tags:
+    - cwprod-use1 # use non-default runner
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[vV](0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+      when: manual
+  variables:
+    <<: *account_cwcloudplatform
+    <<: *region_use1
+    APP_CONCURRENCY: 10
+    APP_DESIRED_COUNT: 2
+    APP_INSTANCE_SIZE: m5ad.2xlarge
+    APP_STACK_TEIR_PATTERN: default
+    APP_STACK_CI_TAGS: win-default,legacy-devs
