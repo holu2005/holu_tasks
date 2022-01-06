@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: JIRA Application - Data Stack
+
+Parameters:
+  # BastionImageId:
+  #   Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  #   Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  #   Description: Amazon Linux 2 ImageId for the Bastion Host
+
+  # BastionInstanceProfile:
+  #   Type: AWS::SSM::Parameter::Value<String>
+  #   Default: /pf-jiraapp-access/resources/iam/instance-profile/svc-bastion/name
+
+  # BastionInstanceSize:
+  #   Type: String
+  #   Default: t3.nano
+  #   AllowedValues:
+  #     - t3.nano
+  #     - t3.micro
+  #     - t3.small
+  #     - t3.medium
+  #     - t2.nano
+  #     - t2.micro
+  #     - t2.small
+  #     - t2.medium
+  #   Description: Size of instance for Bastion Host
+
+  RdsPostgresDbInstanceSize:
+    Type: String
+    Default: db.r4.large
+
+  DBEngineVersion:
+    Description: Select Database Engine Version
+    Type: String
+    Default: "10.16"
+    AllowedValues:
+    - "9.6.3"
+    - "9.6.6"
+    - "9.6.8"
+    - "9.6.9"
+    - "9.6.11"
+    - "9.6.12"
+    - "9.6.16"
+    - "9.6.17"
+    - "9.6.18"
+    - "9.6.19"
+    - "9.6.21"
+    - "9.6.22"
+    - "10.4"
+    - "10.5"
+    - "10.6"
+    - "10.7"
+    - "10.11"
+    - "10.12"
+    - "10.13"
+    - "10.14"
+    - "10.14"
+    - "10.16"
+    - "10.17"
+    - "11.4"
+    - "11.6"
+    - "11.7"
+    - "11.8"
+    - "11.9"
+    - "11.11"
+    - "11.12"
+    - "12.4"
+    - "12.6"
+    - "12.7"
+    - "13.3"
+
+  # BastionKey:
+  #   Type: AWS::EC2::KeyPair::KeyName
+  #   Description: EC2 KeyPair for Bastion Host
+
+  # BastionSecGrp:
+  #   Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+
+  PostgresRdsDbClusterSecGrp:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+
+  RdsClusterName:
+    Type: String
+
+  RdsClusterSnapshotName:
+    Type: String
+    Default: ""
+    Description: The name of a DB snapshot (optional)
+
+  VpcNetworkPrivateSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+    Default: /pf-vpcnetwork-default/resources/ec2/subnet/-/private-subnets/subnet-ids
+
+  # JiraSubnetIds:
+  #   Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+  #   Default: /pf-vpcnetwork-default/resources/ec2/subnet/private-01/subnet-id
+
+  JiraEfsMountSecGrpId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+ 
+  # VpcNetworkPublicSubnetIds:
+  #   Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+  #   Default: /pf-vpcnetwork-default/resources/ec2/subnet/-/public-subnets/subnet-ids
+
+Conditions:
+  UseDbSnapshot: !Not
+    - Fn::Equals:
+        - !Ref RdsClusterSnapshotName
+        - ""
+
+Resources:
+  # BastionAutoScalingGroup:
+  #   DependsOn:
+  #     - PostgresRdsDbCluster
+  #   Type: AWS::AutoScaling::AutoScalingGroup
+  #   CreationPolicy:
+  #     ResourceSignal:
+  #       Count: 1
+  #       Timeout: PT5M
+  #   Properties:
+  #     DesiredCapacity: "1"
+  #     LaunchConfigurationName: !Ref BastionLaunchConfig
+  #     MaxSize: "2"
+  #     MinSize: "1"
+  #     Tags:
+  #       - Key: Name
+  #         PropagateAtLaunch: true
+  #         Value: !Sub ${AWS::StackName}-bastion
+  #     VPCZoneIdentifier: !Ref VpcNetworkPublicSubnetIds
+  #   UpdatePolicy:
+  #     AutoScalingRollingUpdate:
+  #       MinInstancesInService: 1
+  #       MinSuccessfulInstancesPercent: 100
+  #       PauseTime: PT5M
+  #       WaitOnResourceSignals: true
+
+  # BastionEIP:
+  #   Type: AWS::EC2::EIP
+  #   Properties:
+  #     Domain: vpc
+
+  # BastionLaunchConfig:
+  #   Type: AWS::AutoScaling::LaunchConfiguration
+  #   Metadata:
+  #     "AWS::CloudFormation::Init":
+  #       "00-ConfigureCloudWatchLogs":
+  #         files:
+  #           /etc/awslogs/awslogs.conf:
+  #             content: !Sub
+  #               - "[general]\nstate_file = /var/lib/awslogs/agent-state\n\n[/var/log/messages]\nfile = /var/log/messages\nlog_group_name = ${BastionLogsGroup}\nlog_stream_name = /ec2/messages/{instance_id}\ndatetime_format = %b %d %H:%M:%S\n\n[/var/log/cloud-init-output.log]\nfile = /var/log/cloud-init-output.log\nlog_group_name = ${BastionLogsGroup}\nlog_stream_name = /ec2/cloud-init-output/{instance_id}\ndatetime_format = %b %d %H:%M:%S\n\n[/var/log/nginx/error.log]\nfile = /var/log/nginx/error.log\nlog_group_name = ${BastionLogsGroup}\nlog_stream_name = /ec2/nginx_error/{instance_id}\ndatetime_format = %b %d %H:%M:%S\n"
+  #               - BastionLogsGroup: !Ref BastionLogsGroup
+  #             group: root
+  #             mode: "000744"
+  #             owner: root
+  #         packages:
+  #           yum:
+  #             awslogs: []
+  #         services:
+  #           sysvinit:
+  #             awslogsd:
+  #               enabled: true
+  #               ensureRunning: true
+  #               files:
+  #                 - /etc/awslogs/awslogs.conf
+  #               packages:
+  #                 yum:
+  #                   - awslogs
+  #       "10-InstallAmazonExtrasLibrary":
+  #         commands:
+  #           "00_install_nginx":
+  #             command: sudo amazon-linux-extras install nginx1.12
+  #       "11-ConfigureProxy":
+  #         files:
+  #           /etc/nginx/nginx.conf:
+  #             content: !Sub
+  #               - "user nginx;\nworker_processes auto;\nerror_log /var/log/nginx/error.log info;\npid /run/nginx.pid;\ninclude /usr/share/nginx/modules/*.conf;\nevents {\n  worker_connections 1024;}\nstream {\nupstream aurora_backend {\n  server ${AuroraEndpoint}:5432;}\nserver {\n  listen 5432;\n  proxy_pass aurora_backend;\n  proxy_timeout 5m;\n  proxy_connect_timeout 60s;}}\n"
+  #               - AuroraEndpoint: !GetAtt PostgresRdsDbCluster.Endpoint.Address
+  #         services:
+  #           sysvinit:
+  #             nginx:
+  #               enabled: true
+  #               ensureRunning: true
+  #               files:
+  #                 - /etc/nginx/nginx.conf
+  #       "50-AttachElasticIp":
+  #         commands:
+  #           "00_attach_eip":
+  #             command: bash /tmp/attach_eip.sh
+  #         files:
+  #           /tmp/attach_eip.sh:
+  #             content: !Sub
+  #               - "#!/bin/bash\nINSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)\naws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id ${EIPAllocationId} --region ${AWS::Region} --allow-reassociation\n"
+  #               - EIPAllocationId: !GetAtt BastionEIP.AllocationId
+  #       "99-Finalize":
+  #         commands:
+  #           "00_signal_success":
+  #             command: !Sub "/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BastionAutoScalingGroup --region ${AWS::Region}"
+  #       configSets:
+  #         config:
+  #           - "00-ConfigureCloudWatchLogs"
+  #           - "10-InstallAmazonExtrasLibrary"
+  #           - "11-ConfigureProxy"
+  #           - "50-AttachElasticIp"
+  #           - "99-Finalize"
+  #   Properties:
+  #     AssociatePublicIpAddress: true
+  #     IamInstanceProfile: !Ref BastionInstanceProfile
+  #     ImageId: !Ref BastionImageId
+  #     InstanceType: !Ref BastionInstanceSize
+  #     KeyName: !Ref BastionKey
+  #     SecurityGroups:
+  #       - !Ref BastionSecGrp
+  #     UserData:
+  #      Fn::Base64: !Sub |
+  #       #!/bin/bash -xe
+  #       yum update -y
+  #       yum install -y aws-cfn-bootstrap
+  #       /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource BastionLaunchConfig --configsets config --region ${AWS::Region}
+
+  # TODO: do we need this if we don't have the bastion?
+  BastionLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 7
+
+  PostgresMasterUserClusterSmSecretTrgAttach:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref PostgresMasterUserSmSecret
+      TargetId: !Ref PostgresRdsDbCluster
+      TargetType: "AWS::RDS::DBCluster"
+
+  PostgresMasterUserSmSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub Postgres db credentials for ${AWS::StackName}
+      GenerateSecretString:
+        ExcludePunctuation: true
+        GenerateStringKey: password
+        PasswordLength: 41
+        SecretStringTemplate: "{\"username\": \"jiraapp\"}"
+      Name: !Sub "${AWS::StackName}/internal/core/postgres-master-secrets"
+
+  PostgresRdsDbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBSubnetGroupName: !Ref PostgresRdsDbSubnetGrp
+      DBClusterParameterGroupName: !Ref PostgresRdsDbClusterParameterGroup
+      DatabaseName: !Sub ${RdsClusterName}
+      Engine: aurora-postgresql
+      EngineVersion: !Ref DBEngineVersion
+      MasterUserPassword: !If
+        - UseDbSnapshot
+        - !Ref "AWS::NoValue"
+        - !Sub "{{resolve:secretsmanager:${PostgresMasterUserSmSecret}:SecretString:password}}"
+      MasterUsername: !If
+        - UseDbSnapshot
+        - !Ref "AWS::NoValue"
+        - !Sub "{{resolve:secretsmanager:${PostgresMasterUserSmSecret}:SecretString:username}}"
+      SnapshotIdentifier: !If
+        - UseDbSnapshot
+        - !Ref RdsClusterSnapshotName
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+      VpcSecurityGroupIds:
+        - !Ref PostgresRdsDbClusterSecGrp
+
+  PostgresRdsDbInstance01:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBParameterGroupName: !Ref PostgresRdsDbParameterGroup
+      DBClusterIdentifier: !Ref PostgresRdsDbCluster
+      DBInstanceClass: !Ref RdsPostgresDbInstanceSize
+      DBSubnetGroupName: !Ref PostgresRdsDbSubnetGrp
+
+  PostgresRdsDbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: postgres db instance parameter group
+      Family: aurora-postgresql10
+      Parameters:
+        log_hostname: "off"
+
+  PostgresRdsDbClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: postgres cluster parameter group
+      Family: aurora-postgresql10
+      Parameters:
+        autovacuum_naptime: "5"
+
+  PostgresRdsDbSubnetGrp:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub subnet grp for ${AWS::StackName}
+      SubnetIds: !Ref VpcNetworkPrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+
+  ParameterPostgresMasterUserSmSecretArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/secretsmanager/secret/postgres-master-secrets/arn
+      Type: String
+      Value: !Ref PostgresMasterUserSmSecret   
+
+  JiraEfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      BackupPolicy:
+        Status: ENABLED
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Efs
+
+  JiraStack00EfsMountTrg:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref JiraEfsFileSystem
+      SubnetId: !Select [0, !Ref VpcNetworkPrivateSubnetIds]
+      SecurityGroups:
+      - !Ref JiraEfsMountSecGrpId
+
+  JiraStack01EfsMountTrg:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref JiraEfsFileSystem
+      SubnetId: !Select [1, !Ref VpcNetworkPrivateSubnetIds]
+      SecurityGroups:
+      - !Ref JiraEfsMountSecGrpId
+
+  JiraStack02EfsMountTrg:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref JiraEfsFileSystem
+      SubnetId: !Select [2, !Ref VpcNetworkPrivateSubnetIds]
+      SecurityGroups:
+      - !Ref JiraEfsMountSecGrpId     
+
+  # --------------------------------------------------------- parameters: efs ---
+
+  ParameterElasticfileSystem:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/efs/filesystem/jira-elastic-filesytem/fileSystem-id
+      Type: String
+      Value: !Ref JiraEfsFileSystem 
+
+
+  ParameterJiraStack00EfsMountTrgIpAddress:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/efs/mount-target/jira-00-subnet-00/file-system-id
+      Type: String
+      Value: !Sub ${JiraStack00EfsMountTrg.IpAddress}
+
+  ParameterJiraStack01EfsMountTrgIpAddress:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/efs/mount-target/jira-00-subnet-01/file-system-id
+      Type: String
+      Value: !Sub ${JiraStack01EfsMountTrg.IpAddress}
+
+  ParameterJiraStack02EfsMountTrgIpAddress:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/efs/mount-target/jira-00-subnet-02/file-system-id
+      Type: String
+      Value: !Sub ${JiraStack02EfsMountTrg.IpAddress}
