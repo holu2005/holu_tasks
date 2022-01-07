@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: JIRA Application - Application Stack
+
+Parameters:
+  CpuReservation:
+    Type: Number
+    Default: "1536"
+
+  EcsClusterGeneralSecGrpId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /pf-ecscluster-devtools/resources/ec2/security-group/general/group-id
+
+  EcsClusterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-ecscluster-devtools/resources/ecs/cluster/cluster-name
+
+  JiraEfSysParam:
+    Type: AWS::SSM::Parameter::Value<String>
+  
+  # EcsClusterEfsMountPoint:
+  #   Type: String
+  #   Default: "/mnt/efs"
+
+  DnsName:
+    Type: String
+    Default: jira-ecs-test.connectwisedev.com
+
+  CertificateArn: 
+    Type: String  
+
+  JiraEcsTaskExecutionIamRoleArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-jiraapp-core/resources/iam/role/svc-jira-ecs-taskexecution/arn
+
+  JiraEcsTaskIamRoleArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-jiraapp-core/resources/iam/role/svc-jira-ecs-task/arn
+
+  JiraImage:
+    Type: String
+
+  JiraEfsPath:
+    Type: String
+    Default: "/"
+
+  MemoryReservation:
+    Type: Number
+    Default: "10000"
+
+  PagerDutyAlarmTopic:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-atlassian/unmanaged-resources/sns/topic/pagerduty-alerts
+
+  PublicHostedZone:
+    Type: String
+
+  PublicHostedZoneId:
+    Type: String
+
+  PublicHostedZoneSubdomainName:
+    Type: String
+
+  RdsClusterSecretArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-jiraapp-core-dev/resources/secretsmanager/secret/postgres-master-secrets/arn
+
+  VpcNetworkId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Default: /pf-vpcnetwork-default/resources/ec2/vpc/vpc-id
+
+  VpcNetworkDnsIp:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-vpcnetwork-default/resources/ec2/vpc/-/dns-ip
+
+  VpcNetworkOfficesUnrestrictedSecGrpId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /pf-vpcnetwork-default/resources/ec2/security-group/offices-unrestricted/group-id
+
+  VpcNetworkCloudNetworksUnrestrictedSecGrpId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /pf-vpcnetwork-default/resources/ec2/security-group/cloud-networks/group-id
+
+  JiraAppSecGroupId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::SecurityGroup::Id>
+    Default: /pf-jiraapp-core/resources/ec2/security-group/jira-public/group-id
+
+  VpcNetworkPublicSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>
+    Default: /pf-vpcnetwork-default/resources/ec2/subnet/-/public-subnets/subnet-ids
+
+  CldMngmntDefaultPublicHostedZoneId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-cloudmanagement-v1/resources/r53/hosted-zone/region-public/hosted-zone-id
+
+  CldMngmntDefaultPublicHostedZone:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pf-cloudmanagement-v1/resources/r53/hosted-zone/region-public/hosted-zone
+
+  StackServiceSubdomain:
+    Type: String
+
+  # TODO: fix this to be different for each account
+  StackEnv:
+    Type: String
+    Default: test
+
+# Conditions:
+#   UseExistingEfsShare: !Not
+#     - !Equals
+#       - !Ref JiraEfsPath
+#       - ""
+
+Resources:
+
+  ConfigDnsPublicParentDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/config/dns/public-parent/domain
+      Type: String
+      Value: !Sub ${StackServiceSubdomain}.${StackEnv}.${CldMngmntDefaultPublicHostedZone}
+
+
+  ConfigDnsPublicParentValidationZoneId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/config/dns/public-parent/validation-zone-id
+      Type: String
+      Value: !Sub ${CldMngmntDefaultPublicHostedZoneId}
+
+
+
+  ConfigDnsPublicStackDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/config/dns/public-stack/domain
+      Type: String
+      Value: !Sub ${ConfigDnsPublicParentDomain.Value}
+
+  ConfigDnsPublicStackValidationZoneId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/config/dns/public-stack/validation-zone-id
+      Type: String
+      Value: !Sub ${ConfigDnsPublicParentValidationZoneId.Value}
+
+
+ # ------------------------------------------------------------------ common ---
+
+  # StackCertManagerCert:
+  #   Type: AWS::CertificateManager::Certificate
+  #   Properties:
+  #     DomainName: !Sub ${ConfigDnsPublicStackDomain.Value}
+  #     DomainValidationOptions:
+  #       - DomainName: !Sub ${ConfigDnsPublicStackDomain.Value}
+  #         HostedZoneId: !Sub ${ConfigDnsPublicStackValidationZoneId.Value}
+  #     ValidationMethod: DNS
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${ConfigDnsPublicStackDomain.Value}
+
+  DnsIp4Record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Sub ${PublicHostedZoneSubdomainName}.${PublicHostedZone}.
+      Type: A
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      HealthCheckGracePeriodSeconds: 300
+      Cluster: !Ref EcsClusterName
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      DesiredCount: 1
+      LoadBalancers:
+        - ContainerName: jira
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      ServiceName: !Sub ${AWS::StackName}
+      TaskDefinition: !Ref EcsTaskDefinition
+
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: jira
+          Cpu: !Ref CpuReservation
+          DnsServers:
+            - !Ref VpcNetworkDnsIp
+          Environment:
+            - Name: ECS_AVAILABLE_LOGGING_DRIVERS
+              Value: "[\"json-file\",\"awslogs\"]"
+            - Name: ATL_PROXY_NAME
+              Value: !Ref DnsName
+            - Name: ATL_PROXY_PORT
+              Value: "443"
+            - Name: ATL_TOMCAT_ENABLELOOKUPS
+              Value: "true"
+            - Name: ATL_TOMCAT_SCHEME
+              Value: "https"
+            - Name: ATL_TOMCAT_PORT
+              Value: "8080"
+            - Name: ATL_TOMCAT_SECURE
+              Value: "true"
+            - Name: JVM_MINIMUM_MEMORY
+              Value: "6144m"
+            - Name: JVM_MAXIMUM_MEMORY
+              Value: "6144m"
+            - Name: JVM_SUPPORT_RECOMMENDED_ARGS
+              Value: "-XX:+UseG1GC -XX:+ExplicitGCInvokesConcurrent"
+          Image: !Ref JiraImage
+          Ulimits:
+            - Name: nproc
+              HardLimit: 65536
+              SoftLimit: 65536
+            - Name: nofile
+              HardLimit: 65536
+              SoftLimit: 65536
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-stream-prefix: Ecs
+          MemoryReservation: !Ref MemoryReservation
+          MountPoints:
+            - ContainerPath: /var/atlassian/application-data/jira/data
+              SourceVolume: !Sub ${AWS::StackName}-jira-data
+            - ContainerPath: /var/atlassian/application-data/jira/plugins
+              SourceVolume: !Sub ${AWS::StackName}-jira-plugins
+            - ContainerPath: /var/atlassian/application-data/jira/caches
+              SourceVolume: !Sub ${AWS::StackName}-jira-caches
+            - ContainerPath: /var/atlassian/application-data/jira/logos
+              SourceVolume: !Sub ${AWS::StackName}-jira-logos
+            - ContainerPath: /var/atlassian/application-data/jira/export
+              SourceVolume: !Sub ${AWS::StackName}-jira-export
+            - ContainerPath: /var/atlassian/application-data/jira/import
+              SourceVolume: !Sub ${AWS::StackName}-jira-import
+            - ContainerPath: /opt/atlassian/jira/temp
+              SourceVolume: !Sub ${AWS::StackName}-jira-temp
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Secrets:
+            - Name: JIRA_DATABASE_OPTIONS
+              ValueFrom: !Ref RdsClusterSecretArn
+      ExecutionRoleArn: !Ref JiraEcsTaskExecutionIamRoleArn
+      RequiresCompatibilities:
+        - EC2
+      TaskRoleArn: !Ref JiraEcsTaskIamRoleArn
+      Volumes:
+        - Name: !Sub ${AWS::StackName}-jira-data
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/data"
+        - Name: !Sub ${AWS::StackName}-jira-plugins
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/plugins"
+        - Name: !Sub ${AWS::StackName}-jira-import
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/import"
+        - Name: !Sub ${AWS::StackName}-jira-caches
+          DockerVolumeConfiguration:
+            Driver: local
+            Autoprovision: true
+            Scope: shared
+        - Name: !Sub ${AWS::StackName}-jira-logos
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/logos"
+        - Name: !Sub ${AWS::StackName}-jira-export
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/export"
+        - Name: !Sub ${AWS::StackName}-jira-temp
+          Host:
+            SourcePath:  !Sub "${JiraEfsPath}/temp"  
+        - Name: !Sub ${AWS::StackName}-jira-MyEfs
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref JiraEfSysParam
+            RootDirectory: !Sub ${JiraEfsPath}
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Host: "#{host}"
+            Path: "/#{path}"
+            Port: "443"
+            Protocol: HTTPS
+            Query: "#{query}"
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP  
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "4000"
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref VpcNetworkCloudNetworksUnrestrictedSecGrpId
+        - !Ref EcsClusterGeneralSecGrpId
+        - !Ref VpcNetworkOfficesUnrestrictedSecGrpId
+        - !Ref JiraAppSecGroupId
+      Subnets: !Ref VpcNetworkPublicSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  # JiraElbListenerCert:
+  #   Type: AWS::ElasticLoadBalancingV2::ListenerCertificate
+  #   Properties:
+  #     Certificates:
+  #       -  CertificateArn: !Ref StackCertManagerCert
+  #     ListenerArn: HttpsListener           
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 300
+      HealthCheckPath: /happy/happy.html
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 120
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      Protocol: HTTP
+      Port: 8080
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+      VpcId: !Ref VpcNetworkId
+
+  # monitoring/alerting --------------------------------------------------------
+
+  ServiceMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+        ComparisonOperator: GreaterThanThreshold
+        EvaluationPeriods: 2
+        MetricName: "CPUUtilization"
+        Unit: Percent
+        Namespace: AWS/ECS
+        Statistic: Average
+        Period: 300 # seconds (5 minutes)
+        Threshold: 80
+        Dimensions:
+            - Name: ServiceName
+              Value: !Ref EcsService
+        AlarmActions:
+          - !Ref PagerDutyAlarmTopic
+        InsufficientDataActions:
+          - !Ref PagerDutyAlarmTopic
+
+
+  ParameterApplicationLoadBalancerArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/resources/ec2/elasticloadbalancing/alb/arn
+      Type: String
+      Value: !Ref LoadBalancer
